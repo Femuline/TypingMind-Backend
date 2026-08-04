@@ -1,7 +1,24 @@
 /**
  * lore.js
  * ---------------------------------------------------------------
- * POST { fandom, media?, year?, arc? }
+ * POST { fandom, media?, year?, arc?, forceRefresh? }
+ *
+ * forceRefresh: true bypasses the 14-day category/episode/character cache
+ * for this call, forcing every page and category to be re-resolved against
+ * Fandom instead of reusing whatever's in Supabase. Use this after a code
+ * change to the category-guessing logic (or any time you suspect a wiki's
+ * category structure was resolved wrong the first time) — otherwise the
+ * old, possibly-wrong result just keeps getting served for up to 14 days.
+ *
+ * Every response (done:true OR done:false) now also includes
+ * episodesRequested (how many episode titles were actually resolved for
+ * this arc — 0 is a valid but meaningful number: it means the episode
+ * category was never found/matched, NOT that the arc has no episodes) and
+ * episodeCategory/episodeCategoryArcScoped (which Fandom category won, and
+ * whether it was scoped to the requested arc or a wiki-wide fallback).
+ * done:true no longer means "found everything" by itself — it only means
+ * "nothing is left in `missing`," which is trivially true if episodesRequested
+ * came back 0. Check episodesRequested to tell those apart.
  *
  * Resolves the Fandom wiki for `fandom`, figures out which episode/character
  * pages belong to `arc` (e.g. "Season 6"), and makes sure each one is cached
@@ -180,7 +197,7 @@ async function resolveWiki(fandom, year) {
   return { wiki: null, attempts };
 }
 
-async function getCachedCategoryMembers(wikiId, categoryName) {
+async function getCachedCategoryMembers(wikiId, categoryName, freshnessMs = FRESHNESS_MS) {
   const { data, error } = await supabase
     .from('lore_categories')
     .select('*')
@@ -189,7 +206,7 @@ async function getCachedCategoryMembers(wikiId, categoryName) {
     .maybeSingle();
   if (error) throw new Error(`Supabase category cache lookup failed: ${error.message}`);
   if (!data) return null;
-  if (Date.now() - new Date(data.fetched_at).getTime() >= FRESHNESS_MS) return null;
+  if (Date.now() - new Date(data.fetched_at).getTime() >= freshnessMs) return null;
   return Array.isArray(data.members) ? data.members : [];
 }
 
@@ -203,8 +220,8 @@ async function cacheCategoryMembers(wikiId, categoryName, members) {
   if (error) throw new Error(`Supabase category cache write failed: ${error.message}`);
 }
 
-async function fetchCategoryMembers(subdomain, wikiId, categoryName, limit) {
-  const cached = await getCachedCategoryMembers(wikiId, categoryName);
+async function fetchCategoryMembers(subdomain, wikiId, categoryName, limit, freshnessMs = FRESHNESS_MS) {
+  const cached = await getCachedCategoryMembers(wikiId, categoryName, freshnessMs);
   if (cached !== null) return cached;
   const url = `https://${subdomain}.fandom.com/api.php?action=query&list=categorymembers&cmtitle=${encodeURIComponent('Category:' + categoryName)}&cmlimit=${limit}&format=json`;
   const data = await apiRequest(url);
@@ -214,7 +231,7 @@ async function fetchCategoryMembers(subdomain, wikiId, categoryName, limit) {
   return titles;
 }
 
-async function findFirstNonEmptyCategory(subdomain, wikiId, candidates, limit) {
+async function findFirstNonEmptyCategory(subdomain, wikiId, candidates, limit, freshnessMs = FRESHNESS_MS) {
   const attempts = [];
   const seen = new Set();
   for (const candidate of candidates) {
@@ -223,7 +240,7 @@ async function findFirstNonEmptyCategory(subdomain, wikiId, candidates, limit) {
     if (!name || seen.has(name)) continue;
     seen.add(name);
     try {
-      const members = await fetchCategoryMembers(subdomain, wikiId, name, limit);
+      const members = await fetchCategoryMembers(subdomain, wikiId, name, limit, freshnessMs);
       if (members.length > 0) return { found: { name, arcScoped, members }, attempts };
     } catch (err) {
       attempts.push(`"${name}": ${err.message}`);
@@ -236,23 +253,42 @@ function withCasings(word) {
   return [...new Set([word, word.charAt(0).toLowerCase() + word.slice(1)])];
 }
 
+// FIX (2026-08): previously this interleaved generic, non-arc-scoped guesses
+// ("<fandom> (<year>) Episodes", "<fandom> Episodes") ahead of the bare arc
+// name ("Season 5"). findFirstNonEmptyCategory() below stops at the FIRST
+// candidate with any members at all, regardless of whether it's arc-scoped —
+// so on any wiki where the generic category happens to resolve (even if it's
+// the wrong, wiki-wide one) before the plain "Season 5"-style category is
+// ever tried, the arc-specific category never gets a chance, even though
+// it's later in a "more specific first" ordering conceptually. Concretely:
+// on wikis whose category names don't repeat the fandom's own name (single-
+// show wikis rarely call their episodes category "<Show> Episodes" — it's
+// usually just "Episodes", with per-season episodes filed under a bare
+// "Season N"), the old order let a wiki-wide, all-seasons category outrank
+// the correct per-season one.
+// Fix: collect every arc-scoped guess FIRST (regardless of fandom/year
+// qualification), exhaust all of those, and only fall back to non-arc-scoped
+// guesses if none of them hit. An arc-scoped match — even a "worse" naming
+// guess — is always more correct than a non-arc-scoped one when an arc was
+// actually requested.
 function buildEpisodeCategoryGuesses(fandom, media, year, arc) {
   const synonyms = MEDIA_EPISODE_SYNONYMS[media] || MEDIA_EPISODE_SYNONYMS.show;
   const primary = synonyms[0];
-  const guesses = [];
-  const addQualified = (prefix, arcScoped) => {
-    for (const word of withCasings(primary)) guesses.push({ name: `${prefix} ${word}`, arcScoped });
+  const arcScopedGuesses = [];
+  const genericGuesses = [];
+  const addQualified = (list, prefix, arcScoped) => {
+    for (const word of withCasings(primary)) list.push({ name: `${prefix} ${word}`, arcScoped });
   };
-  if (arc && year) addQualified(`${fandom} (${year}) ${arc}`, true);
-  if (arc) addQualified(`${fandom} ${arc}`, true);
-  if (year) addQualified(`${fandom} (${year})`, false);
-  addQualified(fandom, false);
+  if (arc && year) addQualified(arcScopedGuesses, `${fandom} (${year}) ${arc}`, true);
+  if (arc) addQualified(arcScopedGuesses, `${fandom} ${arc}`, true);
   if (arc) {
-    guesses.push({ name: `${arc} ${primary}`, arcScoped: true });
-    guesses.push({ name: arc, arcScoped: true });
+    arcScopedGuesses.push({ name: `${arc} ${primary}`, arcScoped: true });
+    arcScopedGuesses.push({ name: arc, arcScoped: true });
   }
-  for (const s of synonyms) guesses.push({ name: s, arcScoped: false });
-  return guesses;
+  if (year) addQualified(genericGuesses, `${fandom} (${year})`, false);
+  addQualified(genericGuesses, fandom, false);
+  for (const s of synonyms) genericGuesses.push({ name: s, arcScoped: false });
+  return [...arcScopedGuesses, ...genericGuesses];
 }
 
 function buildCharacterCategoryGuesses(fandom, year) {
@@ -433,7 +469,7 @@ async function getOrCreateWiki(fandom, year) {
   return { wikiRow: inserted, attempts };
 }
 
-async function getCachedEpisodes(wikiId, titles) {
+async function getCachedEpisodes(wikiId, titles, freshnessMs = FRESHNESS_MS) {
   if (!titles.length) return {};
   // Deliberately NOT using .in('title', titles) here. PostgREST's `in.()`
   // filter is a comma-delimited list, and treats comma/period/colon/parens
@@ -454,12 +490,12 @@ async function getCachedEpisodes(wikiId, titles) {
   const now = Date.now();
   for (const row of data || []) {
     if (!wanted.has(row.title)) continue;
-    if (now - new Date(row.fetched_at).getTime() < FRESHNESS_MS) byTitle[row.title] = row;
+    if (now - new Date(row.fetched_at).getTime() < freshnessMs) byTitle[row.title] = row;
   }
   return byTitle;
 }
 
-async function getCachedCharacters(wikiId, titles) {
+async function getCachedCharacters(wikiId, titles, freshnessMs = FRESHNESS_MS) {
   if (!titles.length) return {};
   // See the matching comment in getCachedEpisodes above — same reserved-
   // character .in() pitfall applies here (character titles/redirects can
@@ -471,7 +507,7 @@ async function getCachedCharacters(wikiId, titles) {
   const now = Date.now();
   for (const row of data || []) {
     if (!wanted.has(row.title)) continue;
-    if (now - new Date(row.fetched_at).getTime() < FRESHNESS_MS) byTitle[row.title] = row;
+    if (now - new Date(row.fetched_at).getTime() < freshnessMs) byTitle[row.title] = row;
   }
   return byTitle;
 }
@@ -507,8 +543,18 @@ export default async function handler(req, res) {
   }
 
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-  const { fandom, media, year, arc } = req.body || {};
+  const { fandom, media, year, arc, forceRefresh } = req.body || {};
   if (!fandom) return res.status(400).json({ error: 'fandom is required' });
+
+  // forceRefresh: true bypasses the 14-day lore_categories/lore_episodes/
+  // lore_characters freshness cache for this call. This is the escape
+  // hatch for "the category guess resolved to the wrong/empty thing once,
+  // and that wrong answer is now cached for two weeks" — without this,
+  // fixing buildEpisodeCategoryGuesses' ordering (see comment on that
+  // function) wouldn't actually change anything for a wiki+arc that was
+  // already resolved once, since every lookup below would just keep
+  // serving the stale cached result until it expires on its own.
+  const freshnessMs = forceRefresh ? 0 : FRESHNESS_MS;
 
   const warnings = [];
   try {
@@ -520,22 +566,38 @@ export default async function handler(req, res) {
     const wiki = { subdomain: wikiRow.subdomain, sitename: wikiRow.sitename, url: wikiRow.base_url };
 
     const episodeCategoryGuesses = buildEpisodeCategoryGuesses(fandom, media, year, arc);
-    const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, episodeCategoryGuesses, 500);
+    const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, episodeCategoryGuesses, 500, freshnessMs);
     let episodeTitles = [];
+    let episodeCategoryArcScoped = false;
     if (episodeCategoryResult.found) {
+      episodeCategoryArcScoped = episodeCategoryResult.found.arcScoped;
       episodeTitles = episodeCategoryResult.found.members;
       if (arc && !episodeCategoryResult.found.arcScoped) {
+        const beforeCount = episodeTitles.length;
         episodeTitles = filterTitlesUpToArc(episodeTitles, arc);
         warnings.push(`No category specific to "${arc}" — filtered by number instead (best-effort).`);
+        // If the number-filter didn't actually remove anything, it's very
+        // likely because none of the titles in this wiki-wide category
+        // encode a season/arc number at all (most TV episode titles don't)
+        // — meaning the "filter" was a silent no-op and episodeTitles is
+        // really just every episode from every arc, not just this one.
+        if (episodeTitles.length === beforeCount) {
+          warnings.push(
+            `"${arc}" filter matched every title in "${episodeCategoryResult.found.name}" (${beforeCount} of ${beforeCount}) — none of them appear to encode a season/arc number, so this is almost certainly the WHOLE-SERIES episode list, not just "${arc}". Treat the resulting corpus as unscoped.`
+          );
+        }
       }
     } else if (episodeCategoryResult.attempts.length) {
       warnings.push(`Couldn't check episode/chapter categories: ${episodeCategoryResult.attempts.join(' | ')}`);
     } else {
       warnings.push('No episode/chapter category found on this wiki.');
     }
+    if (arc && episodeTitles.length === 0) {
+      warnings.push(`No episodes were resolved for "${arc}" specifically — the corpus for this arc will contain 0 episodes even though the request will still report done:true once characters are handled.`);
+    }
 
     const characterCategoryGuesses = buildCharacterCategoryGuesses(fandom, year);
-    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, characterCategoryGuesses, 500);
+    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, characterCategoryGuesses, 500, freshnessMs);
     const characterTitles = characterCategoryResult.found ? characterCategoryResult.found.members : [];
     if (!characterCategoryResult.found) {
       if (characterCategoryResult.attempts.length) {
@@ -545,8 +607,8 @@ export default async function handler(req, res) {
       }
     }
 
-    const cachedEpisodes = await getCachedEpisodes(wikiRow.id, episodeTitles);
-    const cachedCharacters = await getCachedCharacters(wikiRow.id, characterTitles);
+    const cachedEpisodes = await getCachedEpisodes(wikiRow.id, episodeTitles, freshnessMs);
+    const cachedCharacters = await getCachedCharacters(wikiRow.id, characterTitles, freshnessMs);
 
     const missing = [
       ...episodeTitles.filter((t) => !cachedEpisodes[t]).map((title) => ({ type: 'episode', title })),
@@ -594,6 +656,9 @@ export default async function handler(req, res) {
         // the problem. Repeating this list is what lets the stall detector
         // name the culprit instead of just reporting "warnings: none".
         attempted: batch.map((item) => item.title),
+        episodesRequested: episodeTitles.length,
+        episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
+        episodeCategoryArcScoped,
         warnings,
       });
     }
@@ -624,7 +689,21 @@ export default async function handler(req, res) {
       };
     });
 
-    return res.status(200).json({ done: true, wiki, arc: arc || null, episodes, characters, warnings });
+    return res.status(200).json({
+      done: true,
+      wiki,
+      arc: arc || null,
+      episodes,
+      characters,
+      // Lets the client tell "this arc genuinely has this many episodes and
+      // we got them all" apart from "we never found an episode category, so
+      // there was nothing to fetch and done:true was trivially true." Same
+      // shape as the done:false progress fields above, on purpose.
+      episodesRequested: episodeTitles.length,
+      episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
+      episodeCategoryArcScoped,
+      warnings,
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
