@@ -45,6 +45,11 @@ const REQUEST_TIMEOUT_MS = 8000;
 const FRESHNESS_MS = 14 * 24 * 60 * 60 * 1000; // re-fetch a page from Fandom at most every 14 days
 
 const MEDIA_TYPES = ['show', 'movie', 'game', 'comic', 'webtoon'];
+// Fandom/Fastly has been known to quietly block requests with a generic or
+// missing User-Agent (returning a 403 or an HTML challenge page instead of
+// JSON) as basic bot protection. Sending a descriptive one avoids that.
+// TODO: swap in a real contact URL/email if you want to be extra safe here.
+const FANDOM_USER_AGENT = 'TypingMind-LoreFetch/1.0 (+https://typingmind-backend.vercel.app)';
 const PLOT_SECTION_NAMES = ['Plot', 'Synopsis', 'Summary']; // tried in this order; some wikis really do call it "Summary"
 const CHARACTER_SECTION_GROUPS = {
   history: ['History', 'Biography', 'Background'],
@@ -78,7 +83,10 @@ async function apiRequest(url) {
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let res;
   try {
-    res = await fetch(`${url}${separator}origin=*`, { signal: controller.signal });
+    res = await fetch(`${url}${separator}origin=*`, {
+      signal: controller.signal,
+      headers: { 'User-Agent': FANDOM_USER_AGENT, Accept: 'application/json' },
+    });
   } catch (err) {
     if (err.name === 'AbortError') throw new Error('request timed out');
     throw new Error(`network error (${err.message})`);
@@ -113,14 +121,15 @@ async function wikiExists(subdomain) {
 }
 
 async function resolveWiki(fandom, year) {
+  const attempts = [];
   for (const subdomain of slugCandidates(fandom, year)) {
     try {
-      return await wikiExists(subdomain);
+      return { wiki: await wikiExists(subdomain), attempts };
     } catch (err) {
-      // try the next candidate
+      attempts.push(`${subdomain}.fandom.com: ${err.message}`);
     }
   }
-  return null;
+  return { wiki: null, attempts };
 }
 
 async function fetchCategoryMembers(subdomain, categoryName, limit) {
@@ -272,17 +281,17 @@ async function fetchCharacterBullets(subdomain, title, warnings) {
 
 // ================= Supabase cache =================
 async function getOrCreateWiki(fandom, year) {
-  const wiki = await resolveWiki(fandom, year);
-  if (!wiki) return null;
+  const { wiki, attempts } = await resolveWiki(fandom, year);
+  if (!wiki) return { wikiRow: null, attempts };
   const { data: existing } = await supabase.from('lore_wikis').select('*').eq('subdomain', wiki.subdomain).maybeSingle();
-  if (existing) return existing;
+  if (existing) return { wikiRow: existing, attempts };
   const { data: inserted, error } = await supabase
     .from('lore_wikis')
     .insert({ fandom, subdomain: wiki.subdomain, sitename: wiki.sitename, base_url: wiki.url })
     .select()
     .single();
   if (error) throw new Error(error.message);
-  return inserted;
+  return { wikiRow: inserted, attempts };
 }
 
 async function getCachedPages(wikiId, pageType, titles) {
@@ -320,8 +329,11 @@ export default async function handler(req, res) {
 
   const warnings = [];
   try {
-    const wikiRow = await getOrCreateWiki(fandom, year);
-    if (!wikiRow) return res.status(200).json({ error: `Couldn't find a Fandom wiki matching "${fandom}"${year ? ` (${year})` : ''}.` });
+    const { wikiRow, attempts } = await getOrCreateWiki(fandom, year);
+    if (!wikiRow) {
+      const detail = attempts && attempts.length ? ` Tried: ${attempts.join(' | ')}` : '';
+      return res.status(200).json({ error: `Couldn't find a Fandom wiki matching "${fandom}"${year ? ` (${year})` : ''}.${detail}` });
+    }
     const wiki = { subdomain: wikiRow.subdomain, sitename: wikiRow.sitename, url: wikiRow.base_url };
 
     const episodeCategoryGuesses = arc ? [`${arc} Episodes`, `${arc}`, 'Episodes', 'Episode Guide', 'Chapters'] : ['Episodes', 'Episode Guide', 'Chapters'];
