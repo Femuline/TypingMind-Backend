@@ -51,7 +51,13 @@
 
   // ---------- Config ----------
   // TODO: point this at your deployed Vercel app (the one with api/lore.js).
-  const LORE_API_BASE = 'https://typingmind-backend.vercel.app/';
+  // NOTE: no trailing slash here — callLoreApiOnce() builds the request URL
+  // as `${LORE_API_BASE}/api/lore`, so a trailing slash here produces a
+  // double slash ("...vercel.app//api/lore"). Vercel redirects that to the
+  // single-slash path, and browsers refuse to follow a redirect during a
+  // CORS preflight (OPTIONS) request — it surfaces as a CORS error even
+  // though the real cause is the extra slash.
+  const LORE_API_BASE = 'https://typingmind-backend.vercel.app';
 
   // ---------- Tunables ----------
   const REQUEST_TIMEOUT_MS = 25000; // a single batch call to /api/lore, including its own Fandom fetches server-side
