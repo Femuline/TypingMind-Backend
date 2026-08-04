@@ -649,17 +649,39 @@
     rescanTimer = null;
   }
 
+  // Bumped on every real chat switch. In-flight async work captures the
+  // value at the moment it started; if that no longer matches by the time
+  // the work resolves, a *different* chat is now active and the result is
+  // stale — discard it instead of writing it into the shared badge/timers.
+  // Without this, an old chat's late-arriving success or error can paint
+  // over whatever chat you've since switched to.
+  let activeGeneration = 0;
+
   function onChatOpened(chatId) {
     stopRechecking();
+    const myGeneration = ++activeGeneration;
     setBadgeState('working', 'Reading this chat\u2019s agent\u2026');
 
     let activeState = null;
     let announcedNewChat = false;
+    // Re-entrancy guard: a single tick() can easily outlive
+    // RECHECK_INTERVAL_MS (3s) — a content-heavy fandom paginated across
+    // several categories, each batch capped at REQUEST_TIMEOUT_MS (25s),
+    // can take well over a minute end to end. Without this flag the recheck
+    // interval below fires another tick() on top of the one still running,
+    // every 3s, indefinitely — stacking up concurrent duplicate fetches
+    // against the same wiki, which is what trips Fandom's rate limit and
+    // makes the badge flap between whichever attempt happens to resolve
+    // last.
+    let tickInFlight = false;
     const startedAt = Date.now();
 
     const tick = () => {
+      if (tickInFlight) return;
+      tickInFlight = true;
       loadCorpusForChat(chatId)
         .then((result) => {
+          if (myGeneration !== activeGeneration) return; // stale — a different chat is active now
           if (result.status === 'no-chat') {
             setBadgeState('working', 'Waiting for this chat to finish loading\u2026');
           } else if (result.status === 'no-agent') {
@@ -678,20 +700,38 @@
             recheckTimer = null; // corpus is loaded — the rescan loop takes over from here
             rescanAndInject(activeState).catch((err) => console.error('[LoreFetch] rescan failed:', err));
             rescanTimer = setInterval(() => {
+              if (myGeneration !== activeGeneration) {
+                // Chat switched since this loop started; stop painting stale data
+                // and free the interval (belt-and-suspenders — stopRechecking()
+                // on the new chat should already have cleared it, but this
+                // interval was only created because a stale generation slipped
+                // past the check above once already; don't let it run forever).
+                clearInterval(rescanTimer);
+                return;
+              }
               rescanAndInject(activeState).catch((err) => console.error('[LoreFetch] rescan failed:', err));
             }, ENTITY_RESCAN_MS);
           }
         })
         .catch((err) => {
+          if (myGeneration !== activeGeneration) return; // stale — a different chat is active now
           console.error('[LoreFetch] load attempt failed:', err);
           setBadgeState('error', String((err && err.message) || err));
           stopRechecking();
+        })
+        .finally(() => {
+          tickInFlight = false;
         });
     };
 
     tick();
     recheckTimer = setInterval(() => {
+      if (myGeneration !== activeGeneration) {
+        clearInterval(recheckTimer);
+        return;
+      }
       if (activeState) return; // corpus already loaded; rescanTimer owns updates now
+      if (tickInFlight) return; // previous tick hasn't resolved yet — don't pile another one on top of it
       const timedOut = Date.now() - startedAt > RECHECK_DURATION_MS;
       if (timedOut) {
         // A brand-new, never-sent chat has no storage record at all yet —
