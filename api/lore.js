@@ -5,7 +5,8 @@
  *
  * Resolves the Fandom wiki for `fandom`, figures out which episode/character
  * pages belong to `arc` (e.g. "Season 6"), and makes sure each one is cached
- * in Supabase (lore_wikis / lore_pages — see supabase-schema.sql).
+ * in Supabase (lore_wikis / lore_characters / lore_episodes — see
+ * supabase-schema.sql).
  *
  * IMPORTANT — this only ever does a small BATCH_SIZE of page fetches per
  * call, then returns { done: false, fetched, remaining, total } so the
@@ -40,8 +41,9 @@
  * called for that kind of thing (Issues for a comic, Chapters for a
  * webtoon, etc).
  *
- * Requires a `lore_categories` table in addition to lore_wikis/lore_pages
- * (see supabase-schema.sql) — caches which pages belong to a resolved
+ * Requires a `lore_categories` table in addition to
+ * lore_wikis/lore_characters/lore_episodes (see supabase-schema.sql) —
+ * caches which pages belong to a resolved
  * Fandom category (e.g. "Season 6 Episodes") so that lookup isn't repeated
  * on every batch call. Columns: wiki_id (fk -> lore_wikis.id), category_name
  * (text), members (jsonb), fetched_at (timestamptz); unique on
@@ -206,10 +208,11 @@ async function resolveWiki(fandom, year) {
 // content-heavy wiki needing many batches was re-resolving every episode/
 // character category candidate (up to 8 live requests) on every one of
 // those batches for an answer that hadn't changed. That's what was
-// compounding into 429s on bigger shows. Cached the same way lore_pages
-// caches page content — see getCachedCategoryMembers/cacheCategoryMembers
-// below, backed by a new `lore_categories` table (wiki_id, category_name,
-// members, fetched_at; unique on wiki_id+category_name).
+// compounding into 429s on bigger shows. Cached the same way lore_episodes/
+// lore_characters cache page content — see getCachedCategoryMembers/
+// cacheCategoryMembers below, backed by a new `lore_categories` table
+// (wiki_id, category_name, members, fetched_at; unique on
+// wiki_id+category_name).
 async function getCachedCategoryMembers(wikiId, categoryName) {
   const { data, error } = await supabase
     .from('lore_categories')
@@ -512,9 +515,9 @@ async function getOrCreateWiki(fandom, year) {
   return { wikiRow: inserted, attempts };
 }
 
-async function getCachedPages(wikiId, pageType, titles) {
+async function getCachedEpisodes(wikiId, titles) {
   if (!titles.length) return {};
-  const { data } = await supabase.from('lore_pages').select('*').eq('wiki_id', wikiId).eq('page_type', pageType).in('title', titles);
+  const { data } = await supabase.from('lore_episodes').select('*').eq('wiki_id', wikiId).in('title', titles);
   const byTitle = {};
   const now = Date.now();
   for (const row of data || []) {
@@ -523,10 +526,40 @@ async function getCachedPages(wikiId, pageType, titles) {
   return byTitle;
 }
 
-async function upsertPage(wikiId, pageType, title, arc, content) {
+async function getCachedCharacters(wikiId, titles) {
+  if (!titles.length) return {};
+  const { data } = await supabase.from('lore_characters').select('*').eq('wiki_id', wikiId).in('title', titles);
+  const byTitle = {};
+  const now = Date.now();
+  for (const row of data || []) {
+    if (now - new Date(row.fetched_at).getTime() < FRESHNESS_MS) byTitle[row.title] = row;
+  }
+  return byTitle;
+}
+
+async function upsertEpisode(wikiId, title, arc, plot) {
   await supabase
-    .from('lore_pages')
-    .upsert({ wiki_id: wikiId, page_type: pageType, title, arc, content, fetched_at: new Date().toISOString() }, { onConflict: 'wiki_id,page_type,title' });
+    .from('lore_episodes')
+    .upsert({ wiki_id: wikiId, title, arc, plot, fetched_at: new Date().toISOString() }, { onConflict: 'wiki_id,title' });
+}
+
+async function upsertCharacter(wikiId, title, bullets) {
+  // Write all four fields explicitly (defaulting missing ones to []) rather
+  // than only the keys fetchCharacterBullets happened to find — otherwise a
+  // re-fetch that finds fewer sections than last time would leave stale
+  // bullets sitting in a column this pass didn't touch.
+  await supabase.from('lore_characters').upsert(
+    {
+      wiki_id: wikiId,
+      title,
+      history: bullets.history || [],
+      powers: bullets.powers || [],
+      relationships: bullets.relationships || [],
+      trivia: bullets.trivia || [],
+      fetched_at: new Date().toISOString(),
+    },
+    { onConflict: 'wiki_id,title' }
+  );
 }
 
 // ================= Handler =================
@@ -580,8 +613,8 @@ export default async function handler(req, res) {
       }
     }
 
-    const cachedEpisodes = await getCachedPages(wikiRow.id, 'episode', episodeTitles);
-    const cachedCharacters = await getCachedPages(wikiRow.id, 'character', characterTitles);
+    const cachedEpisodes = await getCachedEpisodes(wikiRow.id, episodeTitles);
+    const cachedCharacters = await getCachedCharacters(wikiRow.id, characterTitles);
 
     const missing = [
       ...episodeTitles.filter((t) => !cachedEpisodes[t]).map((title) => ({ type: 'episode', title })),
@@ -594,10 +627,10 @@ export default async function handler(req, res) {
         try {
           if (item.type === 'episode') {
             const plot = await fetchEpisodePlot(wiki.subdomain, item.title, warnings);
-            await upsertPage(wikiRow.id, 'episode', item.title, arc || null, { plot });
+            await upsertEpisode(wikiRow.id, item.title, arc || null, plot);
           } else {
             const bullets = await fetchCharacterBullets(wiki.subdomain, item.title, warnings);
-            await upsertPage(wikiRow.id, 'character', item.title, null, bullets);
+            await upsertCharacter(wikiRow.id, item.title, bullets);
           }
         } catch (err) {
           warnings.push(`Couldn't fetch "${item.title}": ${err.message}`);
@@ -614,8 +647,17 @@ export default async function handler(req, res) {
     }
 
     // Everything's cached — return the full corpus.
-    const episodes = episodeTitles.map((title) => ({ title, plot: (cachedEpisodes[title] && cachedEpisodes[title].content.plot) || '' })).filter((e) => e.plot);
-    const characters = characterTitles.map((title) => ({ name: title, ...((cachedCharacters[title] && cachedCharacters[title].content) || {}) }));
+    const episodes = episodeTitles.map((title) => ({ title, plot: (cachedEpisodes[title] && cachedEpisodes[title].plot) || '' })).filter((e) => e.plot);
+    const characters = characterTitles.map((title) => {
+      const row = cachedCharacters[title];
+      return {
+        name: title,
+        history: (row && row.history) || [],
+        powers: (row && row.powers) || [],
+        relationships: (row && row.relationships) || [],
+        trivia: (row && row.trivia) || [],
+      };
+    });
 
     return res.status(200).json({ done: true, wiki, arc: arc || null, episodes, characters, warnings });
   } catch (err) {
