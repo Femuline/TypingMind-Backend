@@ -299,7 +299,17 @@ async function getOrCreateWiki(fandom, year) {
   // resolveWiki() first regardless of cache state, so every refresh/rescan
   // re-hit Fandom even for a fandom that had already succeeded, which is
   // what was compounding into 429s.
-  const { data: cachedByFandom } = await supabase.from('lore_wikis').select('*').ilike('fandom', fandom).maybeSingle();
+  const { data: cachedByFandom, error: cacheLookupError } = await supabase
+    .from('lore_wikis')
+    .select('*')
+    .ilike('fandom', fandom)
+    .maybeSingle();
+  if (cacheLookupError) {
+    // Don't silently fall through to a live Fandom call on a DB problem —
+    // that would masquerade as "rate limited" or "wiki not found" and send
+    // debugging in the wrong direction entirely.
+    throw new Error(`Supabase cache lookup failed: ${cacheLookupError.message}`);
+  }
   if (cachedByFandom) return { wikiRow: cachedByFandom, attempts: [] };
 
   const { wiki, attempts } = await resolveWiki(fandom, year);
