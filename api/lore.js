@@ -1,7 +1,21 @@
 /**
  * lore.js
  * ---------------------------------------------------------------
- * POST { fandom, media?, year?, arc?, forceRefresh? }
+ * POST { fandom, media?, year?, arc?, forceRefresh?, mode? }
+ *
+ * mode: 'diagnose' skips all fetching/caching work and instead reports what
+ * the server THINKS should exist versus what's actually in Supabase right
+ * now — every episode-category guess and how many members each one has (not
+ * just the first non-empty one that won), which lore_wikis row is being
+ * used, whether other lore_wikis rows also match this fandom, which
+ * resolved titles have a row, which rows have an empty plot, and what `arc`
+ * values are actually stored. Use this when the badge reports N episodes
+ * loaded but you can't find them in the table: it distinguishes "the
+ * category resolved wrong" from "the pages failed to fetch" from "the rows
+ * are there and you're filtering on the wrong arc/wiki_id."
+ * NOTE: diagnose probes EVERY category guess instead of stopping at the
+ * first hit, so a cold run makes ~10 Fandom calls and can approach Vercel's
+ * 10s Hobby cap. Cached categories make repeat runs near-instant.
  *
  * forceRefresh: true bypasses the 14-day category/episode/character cache
  * for this call, forcing every page and category to be re-resolved against
@@ -9,6 +23,8 @@
  * change to the category-guessing logic (or any time you suspect a wiki's
  * category structure was resolved wrong the first time) — otherwise the
  * old, possibly-wrong result just keeps getting served for up to 14 days.
+ * It applies to diagnose too, so you can preview what a refresh WOULD
+ * resolve before paying for one.
  *
  * Every response (done:true OR done:false) now also includes
  * episodesRequested (how many episode titles were actually resolved for
@@ -32,6 +48,15 @@
  * in Pro's default 60s — batching sidesteps that entirely instead of
  * depending on a generous timeout. Once nothing is missing, it returns
  * { done: true, wiki, arc, episodes, characters, warnings }.
+ *
+ * A NOTE ON `arc` IN lore_episodes — this column is a label recorded by
+ * whichever request happened to fetch the page, NOT an intrinsic property
+ * of the episode, and no read path in this file filters on it. It is only
+ * ever written when a request actually supplied an arc (see upsertEpisode)
+ * so that an arc-less call can't blank out a correct label, but a title
+ * that legitimately belongs to several arcs can still only hold one value.
+ * If you need trustworthy per-arc queries, make this a text[] of arcs or
+ * add a lore_episode_arcs join table.
  *
  * PLOT vs SUMMARY — some wikis (Charmed, Buffy, Angel, ...) don't put the
  * full plot in a section on the episode page at all; they put a one-
@@ -77,6 +102,13 @@
  * On the Next.js App Router, this needs the route-handler export shape
  * instead (`export async function POST(request) {...}` returning a
  * Response) — say the word if that's your setup and I'll adapt it.
+ *
+ * SECURITY — there is no authentication on this endpoint. mode:'diagnose'
+ * widens what an unauthenticated caller can read (wiki rows, episode
+ * titles, row counts — no plot text, no credentials, no writes). If that
+ * matters for your deployment, gate it behind a shared secret: set
+ * LORE_DIAGNOSE_TOKEN in the environment and this handler will require a
+ * matching x-lore-token header before running diagnose.
  *
  * CORS — this endpoint is called directly from the browser (the TypingMind
  * extension runs as page JS on typingmind.com, not from a server), so it
@@ -130,7 +162,10 @@ function applyCors(req, res) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  // x-lore-token is only used by mode:'diagnose' (see the SECURITY note in
+  // the header) but must be advertised here or the browser's preflight
+  // rejects the request before this code ever runs.
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-lore-token');
 }
 
 // ================= Fandom wiki fetching =================
@@ -249,13 +284,37 @@ async function findFirstNonEmptyCategory(subdomain, wikiId, candidates, limit, f
   return { found: null, attempts };
 }
 
+// Like findFirstNonEmptyCategory, but does NOT stop at the first hit —
+// reports every candidate so a diagnose run can show which category names
+// actually exist on the wiki, how many members each has, and which one
+// would have won. Only used by mode:'diagnose'; the normal request path
+// still short-circuits, since probing everything costs one Fandom call per
+// guess on a cold cache.
+async function probeCategories(subdomain, wikiId, candidates, limit, freshnessMs = FRESHNESS_MS) {
+  const results = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const name = typeof candidate === 'string' ? candidate : candidate.name;
+    const arcScoped = typeof candidate === 'string' ? false : !!candidate.arcScoped;
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    try {
+      const members = await fetchCategoryMembers(subdomain, wikiId, name, limit, freshnessMs);
+      results.push({ name, arcScoped, memberCount: members.length, sample: members.slice(0, 5), members });
+    } catch (err) {
+      results.push({ name, arcScoped, error: err.message });
+    }
+  }
+  return results;
+}
+
 function withCasings(word) {
   return [...new Set([word, word.charAt(0).toLowerCase() + word.slice(1)])];
 }
 
 // FIX (2026-08): previously this interleaved generic, non-arc-scoped guesses
 // ("<fandom> (<year>) Episodes", "<fandom> Episodes") ahead of the bare arc
-// name ("Season 5"). findFirstNonEmptyCategory() below stops at the FIRST
+// name ("Season 5"). findFirstNonEmptyCategory() above stops at the FIRST
 // candidate with any members at all, regardless of whether it's arc-scoped —
 // so on any wiki where the generic category happens to resolve (even if it's
 // the wrong, wiki-wide one) before the plain "Season 5"-style category is
@@ -513,9 +572,19 @@ async function getCachedCharacters(wikiId, titles, freshnessMs = FRESHNESS_MS) {
 }
 
 async function upsertEpisode(wikiId, title, arc, plot) {
-  const { error } = await supabase
-    .from('lore_episodes')
-    .upsert({ wiki_id: wikiId, title, arc, plot, fetched_at: new Date().toISOString() }, { onConflict: 'wiki_id,title' });
+  const row = { wiki_id: wikiId, title, plot, fetched_at: new Date().toISOString() };
+  // FIX (2026-08): only write `arc` when we actually have one. This used to
+  // be `arc: arc || null` unconditionally, which meant ANY arc-less call
+  // touching a title (a curl test, an agent prompt with no season clause,
+  // a whole-series fetch) blanked out the arc label a previous, correctly
+  // arc-scoped call had written. Since PostgREST's ON CONFLICT DO UPDATE
+  // only sets the columns present in the payload, omitting the key leaves
+  // the existing value alone. No read path in this file filters on `arc`,
+  // so the corpus kept returning all the episodes while a manual
+  // `WHERE arc = 'Season 5'` query returned nothing — which is exactly the
+  // "the badge says 23 episodes but the table looks empty" symptom.
+  if (arc) row.arc = arc;
+  const { error } = await supabase.from('lore_episodes').upsert(row, { onConflict: 'wiki_id,title' });
   if (error) throw new Error(`Supabase episode upsert failed: ${error.message}`);
 }
 
@@ -535,6 +604,172 @@ async function upsertCharacter(wikiId, title, bullets) {
   if (error) throw new Error(`Supabase character upsert failed: ${error.message}`);
 }
 
+// ================= Diagnose mode =================
+// Reads back what's actually stored for a wiki WITHOUT pulling plot text —
+// a full season of plots is hundreds of KB and none of it is needed to
+// answer "is the row there, and does it have anything in it?". Emptiness is
+// established with two narrow filtered queries instead.
+async function inspectEpisodeRows(wikiId) {
+  const { data: rows, error } = await supabase
+    .from('lore_episodes')
+    .select('title, arc, fetched_at')
+    .eq('wiki_id', wikiId);
+  if (error) throw new Error(`Supabase episode row inspect failed: ${error.message}`);
+
+  // Two explicit queries rather than one .or('plot.is.null,plot.eq.') —
+  // an empty-string value inside an or() filter string is ambiguous to
+  // parse, and this file already avoids hand-built PostgREST filter
+  // strings wherever a title/value could confuse them.
+  const { data: nullPlot, error: nullErr } = await supabase
+    .from('lore_episodes')
+    .select('title')
+    .eq('wiki_id', wikiId)
+    .is('plot', null);
+  if (nullErr) throw new Error(`Supabase null-plot inspect failed: ${nullErr.message}`);
+
+  const { data: blankPlot, error: blankErr } = await supabase
+    .from('lore_episodes')
+    .select('title')
+    .eq('wiki_id', wikiId)
+    .eq('plot', '');
+  if (blankErr) throw new Error(`Supabase blank-plot inspect failed: ${blankErr.message}`);
+
+  const emptyTitles = new Set([...(nullPlot || []), ...(blankPlot || [])].map((r) => r.title));
+  const byTitle = {};
+  const arcCounts = {};
+  for (const row of rows || []) {
+    byTitle[row.title] = {
+      arc: row.arc,
+      fetchedAt: row.fetched_at,
+      ageDays: Math.round((Date.now() - new Date(row.fetched_at).getTime()) / 86400000),
+      plotEmpty: emptyTitles.has(row.title),
+    };
+    const key = row.arc === null || row.arc === undefined ? '(null)' : row.arc;
+    arcCounts[key] = (arcCounts[key] || 0) + 1;
+  }
+  return { byTitle, arcCounts, totalRows: (rows || []).length };
+}
+
+// Every lore_wikis row that could plausibly be "this fandom's wiki", with a
+// row count each. getOrCreateWiki matches on ilike(fandom) with no year
+// scoping, so duplicates are entirely possible — and episodes hanging off a
+// wiki_id you weren't looking at is one of the main ways the table appears
+// empty when it isn't. Filtered in JS rather than with an or() filter
+// string for the same reserved-character reasons noted elsewhere in this
+// file; lore_wikis is small enough that scanning it is free.
+async function findWikiCandidates(fandom) {
+  const { data: rows, error } = await supabase.from('lore_wikis').select('*');
+  if (error) throw new Error(`Supabase wiki inspect failed: ${error.message}`);
+
+  const needle = fandom.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const matches = (rows || []).filter((row) => {
+    const rowFandom = (row.fandom || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const rowSub = (row.subdomain || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    return rowFandom.includes(needle) || needle.includes(rowFandom) || rowSub.includes(needle);
+  });
+
+  const candidates = [];
+  for (const row of matches) {
+    const [{ count: epCount }, { count: chCount }] = await Promise.all([
+      supabase.from('lore_episodes').select('*', { count: 'exact', head: true }).eq('wiki_id', row.id),
+      supabase.from('lore_characters').select('*', { count: 'exact', head: true }).eq('wiki_id', row.id),
+    ]);
+    candidates.push({
+      id: row.id,
+      fandom: row.fandom,
+      subdomain: row.subdomain,
+      sitename: row.sitename,
+      episodeRows: epCount ?? 0,
+      characterRows: chCount ?? 0,
+    });
+  }
+  return candidates;
+}
+
+async function handleDiagnose(res, { fandom, media, year, arc, freshnessMs }) {
+  const wikiCandidates = await findWikiCandidates(fandom);
+
+  const { wikiRow, attempts } = await getOrCreateWiki(fandom, year);
+  if (!wikiRow) {
+    return res.status(200).json({
+      mode: 'diagnose',
+      wikiCandidates,
+      wikiResolveAttempts: attempts,
+      error: `Couldn't resolve a Fandom wiki for "${fandom}"${year ? ` (${year})` : ''}.`,
+    });
+  }
+
+  const episodeProbes = await probeCategories(
+    wikiRow.subdomain,
+    wikiRow.id,
+    buildEpisodeCategoryGuesses(fandom, media, year, arc),
+    500,
+    freshnessMs
+  );
+  // Same selection rule findFirstNonEmptyCategory uses, applied to the
+  // already-ordered probe list, so "winner" here is genuinely what a real
+  // request would have picked — not a separate heuristic that could drift.
+  const winner = episodeProbes.find((p) => p.memberCount > 0) || null;
+
+  let resolvedTitles = winner ? winner.members : [];
+  let arcFilterApplied = false;
+  if (winner && arc && !winner.arcScoped) {
+    const before = resolvedTitles.length;
+    resolvedTitles = filterTitlesUpToArc(resolvedTitles, arc);
+    arcFilterApplied = resolvedTitles.length === before ? 'no-op (matched every title)' : `${before} -> ${resolvedTitles.length}`;
+  }
+
+  const { byTitle, arcCounts, totalRows } = await inspectEpisodeRows(wikiRow.id);
+  const resolvedSet = new Set(resolvedTitles);
+
+  const titleReport = resolvedTitles.map((title) => ({
+    title,
+    inDb: !!byTitle[title],
+    arcInDb: byTitle[title] ? byTitle[title].arc : null,
+    plotEmpty: byTitle[title] ? byTitle[title].plotEmpty : null,
+    ageDays: byTitle[title] ? byTitle[title].ageDays : null,
+  }));
+
+  const characterProbes = await probeCategories(
+    wikiRow.subdomain,
+    wikiRow.id,
+    buildCharacterCategoryGuesses(fandom, year),
+    500,
+    freshnessMs
+  );
+  const characterWinner = characterProbes.find((p) => p.memberCount > 0) || null;
+
+  return res.status(200).json({
+    mode: 'diagnose',
+    request: { fandom, media: media || null, year: year || null, arc: arc || null, freshnessBypassed: freshnessMs === 0 },
+    wikiCandidates,
+    wikiUsed: { id: wikiRow.id, fandom: wikiRow.fandom, subdomain: wikiRow.subdomain, sitename: wikiRow.sitename },
+    // `members` is stripped from the probe output — the titles are already
+    // reported in full under `episodes` for the winner, and echoing 500
+    // titles per candidate would bloat the response for no benefit.
+    episodeCategoryProbes: episodeProbes.map(({ members, ...rest }) => rest),
+    episodeCategoryWinner: winner ? { name: winner.name, arcScoped: winner.arcScoped, memberCount: winner.memberCount } : null,
+    characterCategoryProbes: characterProbes.map(({ members, ...rest }) => rest),
+    characterCategoryWinner: characterWinner
+      ? { name: characterWinner.name, memberCount: characterWinner.memberCount }
+      : null,
+    arcFilterApplied,
+    resolvedEpisodeCount: resolvedTitles.length,
+    episodes: titleReport,
+    missingFromDb: titleReport.filter((t) => !t.inDb).map((t) => t.title),
+    inDbButEmptyPlot: titleReport.filter((t) => t.plotEmpty).map((t) => t.title),
+    // Rows on this wiki that the current arc request doesn't ask for. If the
+    // episodes you're looking for are HERE rather than in `episodes` above,
+    // the category resolution is the problem, not the caching.
+    orphanRowsSample: Object.keys(byTitle).filter((t) => !resolvedSet.has(t)).slice(0, 50),
+    totalEpisodeRowsForWiki: totalRows,
+    // Distinct arc values as actually stored. If this reads {"(null)": 23}
+    // while you requested "Season 5", that's the missing-rows mystery: the
+    // rows exist, but your query's arc filter can't see them.
+    arcValuesInDb: arcCounts,
+  });
+}
+
 // ================= Handler =================
 export default async function handler(req, res) {
   applyCors(req, res);
@@ -543,7 +778,7 @@ export default async function handler(req, res) {
   }
 
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-  const { fandom, media, year, arc, forceRefresh } = req.body || {};
+  const { fandom, media, year, arc, forceRefresh, mode } = req.body || {};
   if (!fandom) return res.status(400).json({ error: 'fandom is required' });
 
   // forceRefresh: true bypasses the 14-day lore_categories/lore_episodes/
@@ -555,6 +790,22 @@ export default async function handler(req, res) {
   // already resolved once, since every lookup below would just keep
   // serving the stale cached result until it expires on its own.
   const freshnessMs = forceRefresh ? 0 : FRESHNESS_MS;
+
+  // Read-only inspection path — no page fetching, no upserts (beyond the
+  // category cache that probing naturally populates). Handled before any
+  // of the normal work below so a diagnose call can never mutate episode
+  // or character rows.
+  if (mode === 'diagnose') {
+    const requiredToken = process.env.LORE_DIAGNOSE_TOKEN;
+    if (requiredToken && req.headers['x-lore-token'] !== requiredToken) {
+      return res.status(401).json({ mode: 'diagnose', error: 'diagnose requires a valid x-lore-token header' });
+    }
+    try {
+      return await handleDiagnose(res, { fandom, media, year, arc, freshnessMs });
+    } catch (err) {
+      return res.status(500).json({ mode: 'diagnose', error: err.message });
+    }
+  }
 
   const warnings = [];
   try {
@@ -583,14 +834,14 @@ export default async function handler(req, res) {
         // really just every episode from every arc, not just this one.
         if (episodeTitles.length === beforeCount) {
           warnings.push(
-            `"${arc}" filter matched every title in "${episodeCategoryResult.found.name}" (${beforeCount} of ${beforeCount}) — none of them appear to encode a season/arc number, so this is almost certainly the WHOLE-SERIES episode list, not just "${arc}". Treat the resulting corpus as unscoped.`
+            `"${arc}" filter matched every title in "${episodeCategoryResult.found.name}" (${beforeCount} of ${beforeCount}) — none of them appear to encode a season/arc number, so this is almost certainly the WHOLE-SERIES episode list, not just "${arc}". Treat the resulting corpus as unscoped. Run mode:'diagnose' to see which category names this wiki actually has.`
           );
         }
       }
     } else if (episodeCategoryResult.attempts.length) {
       warnings.push(`Couldn't check episode/chapter categories: ${episodeCategoryResult.attempts.join(' | ')}`);
     } else {
-      warnings.push('No episode/chapter category found on this wiki.');
+      warnings.push("No episode/chapter category found on this wiki. Run mode:'diagnose' to see every category name that was tried.");
     }
     if (arc && episodeTitles.length === 0) {
       warnings.push(`No episodes were resolved for "${arc}" specifically — the corpus for this arc will contain 0 episodes even though the request will still report done:true once characters are handled.`);
@@ -702,6 +953,11 @@ export default async function handler(req, res) {
       episodesRequested: episodeTitles.length,
       episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
       episodeCategoryArcScoped,
+      // Which wiki_id the rows were actually written under. Without this,
+      // reconciling the corpus against the table means guessing which
+      // lore_wikis row to filter on — and duplicates are possible (see
+      // getOrCreateWiki's ilike match).
+      wikiId: wikiRow.id,
       warnings,
     });
   } catch (err) {
