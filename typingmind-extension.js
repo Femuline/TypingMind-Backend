@@ -1,5 +1,5 @@
 /**
- * typingmind-lore-extension.js
+ * typingmind-extension.js
  * ---------------------------------------------------------------
  * Install this as a TypingMind extension (Preferences → Extensions →
  * add script URL, per https://docs.typingmind.com/typingmind-extensions).
@@ -238,10 +238,19 @@
   }
 
   async function fetchLoreCorpus(params, onProgress) {
+    // Each /api/lore call is a separate serverless invocation with its own
+    // fresh `warnings` array — lore.js doesn't (and can't, statelessly)
+    // persist warnings from one batch to the next. If we only kept the
+    // final done:true call's warnings, everything flagged during the
+    // batches leading up to it (e.g. "no Plot subpage/section found — used
+    // the page intro instead") would just vanish, even though that's
+    // exactly the kind of thing worth surfacing.
+    const allWarnings = [];
     for (;;) {
       const result = await callLoreApiOnce(params);
       if (result.error) throw new Error(result.error);
-      if (result.done) return result;
+      if (Array.isArray(result.warnings) && result.warnings.length) allWarnings.push(...result.warnings);
+      if (result.done) return { ...result, warnings: allWarnings };
       debugLog(`batch progress: ${result.fetched} fetched this call, ${result.remaining} left of ${result.total}`);
       if (onProgress) onProgress(result);
     }
