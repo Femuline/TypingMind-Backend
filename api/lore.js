@@ -317,7 +317,7 @@ function cleanWikitext(wikitext) {
 }
 
 async function fetchPageSections(subdomain, title) {
-  const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=sections&format=json`;
+  const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=sections&redirects=1&format=json`;
   const data = await apiRequest(url);
   const sections = (data && data.parse && data.parse.sections) || [];
   return sections.map((s) => ({ index: s.index, line: s.line }));
@@ -337,7 +337,7 @@ function findSectionIndex(sections, candidateNames) {
 }
 
 async function fetchSectionWikitext(subdomain, title, sectionIndex) {
-  const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=wikitext&section=${sectionIndex}&format=json`;
+  const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=wikitext&section=${sectionIndex}&redirects=1&format=json`;
   const data = await apiRequest(url);
   const field = data && data.parse && data.parse.wikitext;
   const wikitext = typeof field === 'string' ? field : field && field['*'];
@@ -345,7 +345,7 @@ async function fetchSectionWikitext(subdomain, title, sectionIndex) {
 }
 
 async function fetchIntroExtract(subdomain, title) {
-  const url = `https://${subdomain}.fandom.com/api.php?action=query&prop=extracts&explaintext=1&exintro=1&titles=${encodeURIComponent(title)}&format=json`;
+  const url = `https://${subdomain}.fandom.com/api.php?action=query&prop=extracts&explaintext=1&exintro=1&redirects=1&titles=${encodeURIComponent(title)}&format=json`;
   const data = await apiRequest(url);
   const pages = data && data.query && data.query.pages;
   const page = pages && Object.values(pages)[0];
@@ -353,7 +353,7 @@ async function fetchIntroExtract(subdomain, title) {
 }
 
 async function fetchFullPageWikitext(subdomain, title) {
-  const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=wikitext&format=json`;
+  const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=wikitext&redirects=1&format=json`;
   const data = await apiRequest(url);
   const field = data && data.parse && data.parse.wikitext;
   const wikitext = typeof field === 'string' ? field : field && field['*'];
@@ -435,11 +435,25 @@ async function getOrCreateWiki(fandom, year) {
 
 async function getCachedEpisodes(wikiId, titles) {
   if (!titles.length) return {};
-  const { data, error } = await supabase.from('lore_episodes').select('*').eq('wiki_id', wikiId).in('title', titles);
+  // Deliberately NOT using .in('title', titles) here. PostgREST's `in.()`
+  // filter is a comma-delimited list, and treats comma/period/colon/parens
+  // as reserved syntax within it — a title containing any of those (e.g.
+  // the Charmed wiki's actual page titles "A Witch's Tail, Part 1" / "...
+  // Part 2") can get mis-parsed as multiple/garbled list entries instead of
+  // one value, so it silently never matches the row. The upsert that WRITES
+  // the row is unaffected (a single scalar value, not a list), so the page
+  // gets "successfully" fetched and cached every round with no error and no
+  // warning, yet never registers as cached on the next round's read — a
+  // silent, permanent stall for any title with a reserved character in it.
+  // Fetching this wiki's rows and matching titles in JS sidesteps the whole
+  // class of reserved-character bugs instead of trying to escape every one.
+  const { data, error } = await supabase.from('lore_episodes').select('*').eq('wiki_id', wikiId);
   if (error) throw new Error(`Supabase episode cache lookup failed: ${error.message}`);
+  const wanted = new Set(titles);
   const byTitle = {};
   const now = Date.now();
   for (const row of data || []) {
+    if (!wanted.has(row.title)) continue;
     if (now - new Date(row.fetched_at).getTime() < FRESHNESS_MS) byTitle[row.title] = row;
   }
   return byTitle;
@@ -447,11 +461,16 @@ async function getCachedEpisodes(wikiId, titles) {
 
 async function getCachedCharacters(wikiId, titles) {
   if (!titles.length) return {};
-  const { data, error } = await supabase.from('lore_characters').select('*').eq('wiki_id', wikiId).in('title', titles);
+  // See the matching comment in getCachedEpisodes above — same reserved-
+  // character .in() pitfall applies here (character titles/redirects can
+  // contain commas, parens, etc. too), so this avoids it the same way.
+  const { data, error } = await supabase.from('lore_characters').select('*').eq('wiki_id', wikiId);
   if (error) throw new Error(`Supabase character cache lookup failed: ${error.message}`);
+  const wanted = new Set(titles);
   const byTitle = {};
   const now = Date.now();
   for (const row of data || []) {
+    if (!wanted.has(row.title)) continue;
     if (now - new Date(row.fetched_at).getTime() < FRESHNESS_MS) byTitle[row.title] = row;
   }
   return byTitle;
@@ -501,7 +520,7 @@ export default async function handler(req, res) {
     const wiki = { subdomain: wikiRow.subdomain, sitename: wikiRow.sitename, url: wikiRow.base_url };
 
     const episodeCategoryGuesses = buildEpisodeCategoryGuesses(fandom, media, year, arc);
-    const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, episodeCategoryGuesses, 60);
+    const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, episodeCategoryGuesses, 500);
     let episodeTitles = [];
     if (episodeCategoryResult.found) {
       episodeTitles = episodeCategoryResult.found.members;
@@ -516,7 +535,7 @@ export default async function handler(req, res) {
     }
 
     const characterCategoryGuesses = buildCharacterCategoryGuesses(fandom, year);
-    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, characterCategoryGuesses, 60);
+    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, characterCategoryGuesses, 500);
     const characterTitles = characterCategoryResult.found ? characterCategoryResult.found.members : [];
     if (!characterCategoryResult.found) {
       if (characterCategoryResult.attempts.length) {
@@ -568,12 +587,32 @@ export default async function handler(req, res) {
         fetched: batch.length,
         remaining: missing.length - batch.length,
         total: episodeTitles.length + characterTitles.length,
+        // Titles this round actually attempted. A page that's silently
+        // stuck (fetch+cache both "succeed" with no error, but the item
+        // never registers as cached — see getCachedEpisodes) produces no
+        // warnings at all, so warnings alone can't tell you which page is
+        // the problem. Repeating this list is what lets the stall detector
+        // name the culprit instead of just reporting "warnings: none".
+        attempted: batch.map((item) => item.title),
         warnings,
       });
     }
 
     // Everything's cached — return the full corpus.
-    const episodes = episodeTitles.map((title) => ({ title, plot: (cachedEpisodes[title] && cachedEpisodes[title].plot) || '' })).filter((e) => e.plot);
+    // Episodes cached with an empty plot (fetch failed and the fallback
+    // placeholder is what's on record) can't be injected as lore, but
+    // dropping them with .filter() and nothing else looks identical to
+    // "never fetched" from the outside — surface which ones instead.
+    const emptyPlotTitles = [];
+    const episodes = [];
+    for (const title of episodeTitles) {
+      const plot = (cachedEpisodes[title] && cachedEpisodes[title].plot) || '';
+      if (plot) episodes.push({ title, plot });
+      else emptyPlotTitles.push(title);
+    }
+    if (emptyPlotTitles.length) {
+      warnings.push(`${emptyPlotTitles.length} episode(s) are cached but have no usable plot text, so they're excluded from the corpus: ${emptyPlotTitles.join(', ')}`);
+    }
     const characters = characterTitles.map((title) => {
       const row = cachedCharacters[title];
       return {
