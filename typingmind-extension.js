@@ -74,6 +74,14 @@
   // server is 6, so 200 rounds is room for ~1200 pages — comfortably above
   // any real fandom's page count.
   const MAX_LORE_BATCHES = 200;
+  // A tighter, faster-firing backstop than MAX_LORE_BATCHES: if the "fetched
+  // so far" count (total - remaining) reports the exact same number this
+  // many rounds in a row, something is permanently stuck rather than just
+  // slow — normal progress always shrinks `missing` by at least one item
+  // within a round or two. Bailing out after 5 rounds instead of waiting for
+  // the full 200-batch cap turns a many-minute silent hang into a
+  // several-second, specific error.
+  const STALL_ROUNDS = 5;
   const HASH_POLL_MS = 500; // fallback: catch chat switches that don't fire hashchange/popstate at all
 
   // ---------- Debug ----------
@@ -261,6 +269,15 @@
     return err;
   }
 
+  // Most-recent-first, deduped — used to put the actually-useful warnings
+  // (which title, which error) at the front of an error message/badge
+  // instead of them getting buried under dozens of repeats of the same
+  // "no Plot subpage" note from earlier, unrelated pages.
+  function summarizeWarnings(warnings) {
+    if (!warnings.length) return 'none';
+    return [...new Set(warnings)].slice(-8).reverse().join(' | ');
+  }
+
   async function fetchLoreCorpus(params, onProgress, isStale) {
     // Each /api/lore call is a separate serverless invocation with its own
     // fresh `warnings` array — lore.js doesn't (and can't, statelessly)
@@ -271,18 +288,52 @@
     // exactly the kind of thing worth surfacing.
     const allWarnings = [];
     let batches = 0;
+    // Tracks "total - remaining" (pages actually resolved so far, success or
+    // cached-failure) round to round. THE BUG THIS CATCHES: if a page's real
+    // fetch fails AND the fallback placeholder-cache write in lore.js *also*
+    // fails (now surfaced properly now that every Supabase call there checks
+    // `error` and throws instead of failing silently), that title can never
+    // leave the server's `missing` set. Once `missing` is down to BATCH_SIZE
+    // or fewer, every remaining call fully drains it into one batch, so
+    // `remaining` reports 0 every round from then on — which is exactly the
+    // "stuck at total/total" badge, forever, even though `done` never flips
+    // true. A healthy corpus always advances this count within a round or
+    // two; one that doesn't move for STALL_ROUNDS straight rounds is that
+    // scenario, not a slow one.
+    let lastProgressCount = -1;
+    let stalledRounds = 0;
     for (;;) {
       if (isStale && isStale()) throw cancelledError();
       if (++batches > MAX_LORE_BATCHES) {
-        throw new Error(`gave up after ${MAX_LORE_BATCHES} batches without finishing — a page is likely failing every round (check server-side warnings/logs)`);
+        const err = new Error(`gave up after ${MAX_LORE_BATCHES} batches without finishing. Recent warnings: ${summarizeWarnings(allWarnings)}`);
+        err.warnings = allWarnings;
+        throw err;
       }
       const result = await callLoreApiOnce(params);
       if (isStale && isStale()) throw cancelledError(); // don't act on a response for a chat we've left
       if (result.error) throw new Error(result.error);
-      if (Array.isArray(result.warnings) && result.warnings.length) allWarnings.push(...result.warnings);
+      if (Array.isArray(result.warnings) && result.warnings.length) {
+        allWarnings.push(...result.warnings);
+        debugLog('round warnings:', result.warnings);
+      }
       if (result.done) return { ...result, warnings: allWarnings };
       debugLog(`batch progress: ${result.fetched} fetched this call, ${result.remaining} left of ${result.total}`);
       if (onProgress) onProgress(result);
+
+      const progressCount = result.total - result.remaining;
+      if (progressCount === lastProgressCount) {
+        stalledRounds += 1;
+        if (stalledRounds >= STALL_ROUNDS) {
+          const err = new Error(
+            `stuck at ${progressCount}/${result.total} for ${STALL_ROUNDS} rounds straight — one or more pages are failing every attempt, including the fallback that's supposed to cache the failure so it can be skipped. Recent warnings: ${summarizeWarnings(allWarnings)}`
+          );
+          err.warnings = allWarnings;
+          throw err;
+        }
+      } else {
+        stalledRounds = 0;
+        lastProgressCount = progressCount;
+      }
     }
   }
 
@@ -644,7 +695,13 @@
       }
       return { status: 'ready', chatKey: chatEntry.key, agentId, parsed, corpus, entityIndex, lastMatchedKey: null };
     } catch (err) {
-      return { status: 'error', warnings: [err.message], fandom: parsed.fandom, arc: parsed.arc };
+      // fetchLoreCorpus's timeout/stall paths attach the specific per-title
+      // warnings it collected (via err.warnings) — surface those in the
+      // badge so you can see WHICH page and WHY without digging through the
+      // console. Falls back to the bare message for anything else (network
+      // errors, a genuine server-side { error } response, etc).
+      const warnings = err && err.warnings && err.warnings.length ? [...new Set(err.warnings)].slice(-8) : [(err && err.message) || String(err)];
+      return { status: 'error', warnings, fandom: parsed.fandom, arc: parsed.arc };
     }
   }
 
