@@ -1,5 +1,5 @@
 /**
- * api/lore.js
+ * lore.js
  * ---------------------------------------------------------------
  * POST { fandom, media?, year?, arc? }
  *
@@ -15,6 +15,13 @@
  * in Pro's default 60s — batching sidesteps that entirely instead of
  * depending on a generous timeout. Once nothing is missing, it returns
  * { done: true, wiki, arc, episodes, characters, warnings }.
+ *
+ * Requires a `lore_categories` table in addition to lore_wikis/lore_pages
+ * (see supabase-schema.sql) — caches which pages belong to a resolved
+ * Fandom category (e.g. "Season 6 Episodes") so that lookup isn't repeated
+ * on every batch call. Columns: wiki_id (fk -> lore_wikis.id), category_name
+ * (text), members (jsonb), fetched_at (timestamptz); unique on
+ * (wiki_id, category_name).
  *
  * Env vars required (Vercel project settings → Environment Variables):
  *   SUPABASE_URL
@@ -145,18 +152,55 @@ async function resolveWiki(fandom, year) {
   return { wiki: null, attempts };
 }
 
-async function fetchCategoryMembers(subdomain, categoryName, limit) {
+// Category membership (e.g. "which pages are in Category:Season 6 Episodes")
+// used to be re-fetched from Fandom's live API on every single invocation —
+// unlike page content, it had no cache at all. Since the client calls this
+// endpoint once per BATCH_SIZE pages until the whole corpus is done, a
+// content-heavy wiki needing many batches was re-resolving every episode/
+// character category candidate (up to 8 live requests) on every one of
+// those batches for an answer that hadn't changed. That's what was
+// compounding into 429s on bigger shows. Cached the same way lore_pages
+// caches page content — see getCachedCategoryMembers/cacheCategoryMembers
+// below, backed by a new `lore_categories` table (wiki_id, category_name,
+// members, fetched_at; unique on wiki_id+category_name).
+async function getCachedCategoryMembers(wikiId, categoryName) {
+  const { data, error } = await supabase
+    .from('lore_categories')
+    .select('*')
+    .eq('wiki_id', wikiId)
+    .eq('category_name', categoryName)
+    .maybeSingle();
+  if (error) throw new Error(`Supabase category cache lookup failed: ${error.message}`);
+  if (!data) return null;
+  if (Date.now() - new Date(data.fetched_at).getTime() >= FRESHNESS_MS) return null; // stale — treat as a miss
+  return Array.isArray(data.members) ? data.members : [];
+}
+
+async function cacheCategoryMembers(wikiId, categoryName, members) {
+  await supabase
+    .from('lore_categories')
+    .upsert(
+      { wiki_id: wikiId, category_name: categoryName, members, fetched_at: new Date().toISOString() },
+      { onConflict: 'wiki_id,category_name' }
+    );
+}
+
+async function fetchCategoryMembers(subdomain, wikiId, categoryName, limit) {
+  const cached = await getCachedCategoryMembers(wikiId, categoryName);
+  if (cached !== null) return cached; // includes the empty-array case — a category that's confirmed empty/nonexistent doesn't need re-checking either
   const url = `https://${subdomain}.fandom.com/api.php?action=query&list=categorymembers&cmtitle=${encodeURIComponent('Category:' + categoryName)}&cmlimit=${limit}&format=json`;
   const data = await apiRequest(url);
   const members = (data && data.query && data.query.categorymembers) || [];
-  return members.filter((m) => m.ns === 0).map((m) => m.title);
+  const titles = members.filter((m) => m.ns === 0).map((m) => m.title);
+  await cacheCategoryMembers(wikiId, categoryName, titles);
+  return titles;
 }
 
-async function findFirstNonEmptyCategory(subdomain, candidateNames, limit) {
+async function findFirstNonEmptyCategory(subdomain, wikiId, candidateNames, limit) {
   const attempts = [];
   for (const name of candidateNames) {
     try {
-      const members = await fetchCategoryMembers(subdomain, name, limit);
+      const members = await fetchCategoryMembers(subdomain, wikiId, name, limit);
       if (members.length > 0) return { found: { name, members }, attempts };
     } catch (err) {
       attempts.push(`"${name}": ${err.message}`);
@@ -370,7 +414,7 @@ export default async function handler(req, res) {
 
     const episodeCategoryGuesses = arc ? [`${arc} Episodes`, `${arc}`, 'Episodes', 'Episode Guide', 'Chapters'] : ['Episodes', 'Episode Guide', 'Chapters'];
     const arcSpecificGuesses = arc ? episodeCategoryGuesses.slice(0, 2) : [];
-    const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, episodeCategoryGuesses, 60);
+    const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, episodeCategoryGuesses, 60);
     let episodeTitles = [];
     if (episodeCategoryResult.found) {
       episodeTitles = episodeCategoryResult.found.members;
@@ -384,7 +428,7 @@ export default async function handler(req, res) {
       warnings.push('No episode/chapter category found on this wiki.');
     }
 
-    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, ['Main Characters', 'Characters', 'Character'], 60);
+    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, ['Main Characters', 'Characters', 'Character'], 60);
     const characterTitles = characterCategoryResult.found ? characterCategoryResult.found.members : [];
     if (!characterCategoryResult.found) {
       if (characterCategoryResult.attempts.length) {
