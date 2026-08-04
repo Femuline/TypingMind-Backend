@@ -77,7 +77,9 @@ function applyCors(req, res) {
 }
 
 // ================= Fandom wiki fetching =================
-async function apiRequest(url) {
+const MAX_429_RETRIES = 3;
+
+async function apiRequest(url, retriesLeft = MAX_429_RETRIES) {
   const separator = url.includes('?') ? '&' : '?';
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -92,6 +94,17 @@ async function apiRequest(url) {
     throw new Error(`network error (${err.message})`);
   } finally {
     clearTimeout(timeoutId);
+  }
+  // Rate-limited — back off and retry rather than treating it as "not
+  // found." Respects Retry-After when Fandom sends one, otherwise a short
+  // increasing wait. Keeps retries small so this can't blow past Vercel's
+  // invocation time limit.
+  if (res.status === 429 && retriesLeft > 0) {
+    const retryAfterHeader = res.headers.get('retry-after');
+    const parsedRetryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : NaN;
+    const waitMs = Number.isFinite(parsedRetryAfter) ? parsedRetryAfter : 800 * (MAX_429_RETRIES - retriesLeft + 1);
+    await delay(waitMs);
+    return apiRequest(url, retriesLeft - 1);
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
@@ -281,6 +294,14 @@ async function fetchCharacterBullets(subdomain, title, warnings) {
 
 // ================= Supabase cache =================
 async function getOrCreateWiki(fandom, year) {
+  // Cache-first: if we've already resolved this fandom before, use that —
+  // don't hit Fandom's live API again. Previously this always called
+  // resolveWiki() first regardless of cache state, so every refresh/rescan
+  // re-hit Fandom even for a fandom that had already succeeded, which is
+  // what was compounding into 429s.
+  const { data: cachedByFandom } = await supabase.from('lore_wikis').select('*').ilike('fandom', fandom).maybeSingle();
+  if (cachedByFandom) return { wikiRow: cachedByFandom, attempts: [] };
+
   const { wiki, attempts } = await resolveWiki(fandom, year);
   if (!wiki) return { wikiRow: null, attempts };
   const { data: existing } = await supabase.from('lore_wikis').select('*').eq('subdomain', wiki.subdomain).maybeSingle();
