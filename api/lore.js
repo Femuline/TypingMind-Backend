@@ -28,6 +28,12 @@
  * On the Next.js App Router, this needs the route-handler export shape
  * instead (`export async function POST(request) {...}` returning a
  * Response) — say the word if that's your setup and I'll adapt it.
+ *
+ * CORS — this endpoint is called directly from the browser (the TypingMind
+ * extension runs as page JS on typingmind.com, not from a server), so it
+ * must send Access-Control-Allow-Origin itself or every request gets
+ * blocked client-side before this code's response is ever read. Only the
+ * origins in ALLOWED_ORIGINS below are allowed to call this function.
  */
 import { createClient } from '@supabase/supabase-js';
 
@@ -47,8 +53,22 @@ const CHARACTER_SECTION_GROUPS = {
   trivia: ['Trivia', 'Notes and Trivia', 'Notes'],
 };
 
+// TODO: add any other origins TypingMind serves the extension from (a
+// custom domain, chat.typingmind.com, etc). Each response can only carry
+// ONE origin value, so this is checked per-request rather than joined.
+const ALLOWED_ORIGINS = ['https://www.typingmind.com'];
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function applyCors(req, res) {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
 // ================= Fandom wiki fetching =================
@@ -284,6 +304,16 @@ async function upsertPage(wikiId, pageType, title, arc, content) {
 
 // ================= Handler =================
 export default async function handler(req, res) {
+  // ---- CORS: must run before any other branching, so the OPTIONS
+  // preflight TypingMind's browser sends ahead of the real POST gets a
+  // clean 200 with the right headers instead of falling into the 405/400
+  // branches below. ----
+  applyCors(req, res);
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  // ---- end CORS ----
+
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
   const { fandom, year, arc } = req.body || {};
   if (!fandom) return res.status(400).json({ error: 'fandom is required' });
