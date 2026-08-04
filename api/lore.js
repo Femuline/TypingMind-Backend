@@ -227,12 +227,13 @@ async function getCachedCategoryMembers(wikiId, categoryName) {
 }
 
 async function cacheCategoryMembers(wikiId, categoryName, members) {
-  await supabase
+  const { error } = await supabase
     .from('lore_categories')
     .upsert(
       { wiki_id: wikiId, category_name: categoryName, members, fetched_at: new Date().toISOString() },
       { onConflict: 'wiki_id,category_name' }
     );
+  if (error) throw new Error(`Supabase upsert failed for category "${categoryName}": ${error.message}`);
 }
 
 async function fetchCategoryMembers(subdomain, wikiId, categoryName, limit) {
@@ -299,7 +300,14 @@ function buildEpisodeCategoryGuesses(fandom, media, year, arc) {
   addQualified(fandom, false);
   if (arc) {
     guesses.push({ name: `${arc} ${primary}`, arcScoped: true });
-    guesses.push({ name: arc, arcScoped: true });
+    // Deliberately NOT falling back to the bare `arc` name (e.g.
+    // "Season 3") as a category guess. Some wikis do use that as a
+    // generic tracking category for every page touched by that season —
+    // characters, images, soundtrack pages, anything — not an
+    // episode-specific list. Because it was marked arcScoped:true it also
+    // skipped filterTitlesUpToArc below, so whatever it contained got
+    // accepted wholesale as "episodes." This is what pulled in 102 non-
+    // episode pages for Degrassi.
   }
   for (const s of synonyms) guesses.push({ name: s, arcScoped: false });
   return guesses;
@@ -538,9 +546,19 @@ async function getCachedCharacters(wikiId, titles) {
 }
 
 async function upsertEpisode(wikiId, title, arc, plot) {
-  await supabase
+  const { error } = await supabase
     .from('lore_episodes')
     .upsert({ wiki_id: wikiId, title, arc, plot, fetched_at: new Date().toISOString() }, { onConflict: 'wiki_id,title' });
+  // supabase-js resolves with { error } on a failed write rather than
+  // throwing — skipping this check is what let a page that fetched fine
+  // from Fandom but failed to SAVE (bad title, RLS, constraint, etc.)
+  // silently stay "missing" forever. Every subsequent batch would
+  // re-fetch it from Fandom, fail to cache it again the same way, and
+  // `done` would never flip true — exactly the endless "84/84 pages"
+  // hang. Throwing here routes it through the existing failure-placeholder
+  // path in the handler instead, so it converges (or surfaces a real
+  // warning) rather than looping silently.
+  if (error) throw new Error(`Supabase upsert failed for episode "${title}": ${error.message}`);
 }
 
 async function upsertCharacter(wikiId, title, bullets) {
@@ -548,7 +566,7 @@ async function upsertCharacter(wikiId, title, bullets) {
   // than only the keys fetchCharacterBullets happened to find — otherwise a
   // re-fetch that finds fewer sections than last time would leave stale
   // bullets sitting in a column this pass didn't touch.
-  await supabase.from('lore_characters').upsert(
+  const { error } = await supabase.from('lore_characters').upsert(
     {
       wiki_id: wikiId,
       title,
@@ -560,6 +578,7 @@ async function upsertCharacter(wikiId, title, bullets) {
     },
     { onConflict: 'wiki_id,title' }
   );
+  if (error) throw new Error(`Supabase upsert failed for character "${title}": ${error.message}`);
 }
 
 // ================= Handler =================
