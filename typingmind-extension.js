@@ -38,6 +38,16 @@
  * chat-message field this script reads (see extractMessageText below) is
  * a best-effort guess, not confirmed against TypingMind's storage the way
  * the agent-record shape below was.
+ * Run `window.LoreFetchRefresh()` to force a full re-check of the CURRENT
+ * chat's lore that bypasses lore.js's 14-day Supabase cache (forceRefresh).
+ * Use this if the badge is green/amber but you suspect a wrong or empty
+ * category got cached — a code fix alone won't change what's already
+ * cached, so this (or manually clearing the relevant lore_categories /
+ * lore_episodes rows) is required to actually pick up the fix.
+ * A badge showing amber with "Lore — incomplete" (not the green "Lore
+ * fetched") means an arc was requested but 0 episodes were resolved for
+ * it — only character info made it into context. Click the badge (or
+ * check window.LoreFetchLastWarnings) to see which category lookup failed.
  *
  * IMPORTANT CAVEAT:
  * The systemMessage write is a raw write into TypingMind's own storage. If
@@ -421,6 +431,29 @@
     return entry.value;
   };
 
+  // Forces a full re-check of the CURRENT chat's lore, bypassing lore.js's
+  // 14-day Supabase cache for category resolution AND every episode/
+  // character page (forceRefresh:true — see lore.js's file header). Use
+  // this any time the badge is green/partial but you suspect the wrong
+  // category or a stale page got cached — e.g. right after fixing/
+  // redeploying lore.js's category-guess logic, since without this the old
+  // (wrong) cached answer would otherwise keep being served until it
+  // naturally expires. This re-fetches EVERY episode and character for the
+  // arc from Fandom again, not just the ones that look missing, so expect
+  // it to take a while (and to make a real batch of requests against
+  // Fandom) for a full season.
+  window.LoreFetchRefresh = function () {
+    const chatId = getCurrentChatId();
+    if (!chatId) {
+      console.warn('[LoreFetch] No chat is currently open.');
+      return;
+    }
+    console.log('%c[LoreFetch] Forcing a fresh recheck (bypassing the server cache) for chat', 'color:#f0b429;font-weight:bold', chatId);
+    stopRechecking();
+    currentChatId = chatId; // checkForChatChange() below is a no-op unless the id actually changes, so set it directly
+    onChatOpened(chatId, { forceRefresh: true });
+  };
+
   // ================= Sidebar icon (matches TypingMind's own nav tabs) =================
   // Anchored off the built-in Sync tab so our button lands in the same list.
   // We CLONE this node rather than hand-building one from a copied class
@@ -617,8 +650,15 @@
     return btn;
   }
 
-  const BADGE_COLORS = { idle: '#9ca3af', working: '#f0b429', success: '#45c97a', skipped: '#9ca3af', error: '#f04545' };
-  const BADGE_TOOLTIPS = { idle: 'Lore', working: 'Fetching lore…', success: 'Lore fetched', skipped: 'Lore — not applicable', error: 'Lore — error' };
+  const BADGE_COLORS = { idle: '#9ca3af', working: '#f0b429', success: '#45c97a', partial: '#f0b429', skipped: '#9ca3af', error: '#f04545' };
+  const BADGE_TOOLTIPS = {
+    idle: 'Lore',
+    working: 'Fetching lore…',
+    success: 'Lore fetched',
+    partial: 'Lore — incomplete (0 episodes found)',
+    skipped: 'Lore — not applicable',
+    error: 'Lore — error',
+  };
 
   // Remembered separately from the DOM so that whenever the real tab shows
   // up (see watchForSidebarMount below), it can be brought up to date
@@ -673,7 +713,9 @@
   // Loads (and caches on the in-memory `state`) the full lore corpus for a
   // chat's agent, then does one entity-match/write pass. Returns nothing —
   // all outcomes are communicated via setBadgeState, same as before.
-  async function loadCorpusForChat(chatId, isStale) {
+  // `forceRefresh`, when true, is forwarded straight to /api/lore so it
+  // bypasses the server's 14-day category/page cache — see window.LoreFetchRefresh().
+  async function loadCorpusForChat(chatId, isStale, forceRefresh) {
     const chatEntry = await resolveStorageKey(chatId);
     if (!chatEntry) return { status: 'no-chat' };
     const chat = chatEntry.value;
@@ -689,7 +731,7 @@
 
     try {
       const corpus = await fetchLoreCorpus(
-        parsed,
+        forceRefresh ? { ...parsed, forceRefresh: true } : parsed,
         (progress) => {
           if (isStale && isStale()) return; // this chat isn't the active one anymore — don't repaint its badge
           setBadgeState('working', `Fetching lore\u2026 ${progress.total - progress.remaining}/${progress.total} pages`);
@@ -701,6 +743,25 @@
       window.LoreFetchLastWarnings = corpus.warnings || [];
       if (!entityIndex.length) {
         return { status: 'error', warnings: corpus.warnings, fandom: parsed.fandom, arc: parsed.arc };
+      }
+      // done:true only ever meant "nothing left in `missing`" — that's
+      // trivially true if the episode category was never found, so treat
+      // "an arc was requested but 0 episodes were resolved for it" as its
+      // own status instead of letting it read as a plain, unqualified
+      // success just because some characters happened to match. See the
+      // episodesRequested doc comment in lore.js's file header.
+      const episodesRequested = typeof corpus.episodesRequested === 'number' ? corpus.episodesRequested : corpus.episodes.length;
+      if (parsed.arc && episodesRequested === 0) {
+        return {
+          status: 'partial',
+          chatKey: chatEntry.key,
+          agentId,
+          parsed,
+          corpus,
+          entityIndex,
+          lastMatchedKey: null,
+          partialReason: `No episodes were found for "${parsed.arc}" — only character info is available. The episode category on ${corpus.wiki.sitename} likely wasn't matched (check the warnings below); run window.LoreFetchRefresh() after fixing/redeploying lore.js.`,
+        };
       }
       return { status: 'ready', chatKey: chatEntry.key, agentId, parsed, corpus, entityIndex, lastMatchedKey: null };
     } catch (err) {
@@ -741,10 +802,26 @@
 
     debugLog(`rescan: ${matched.length}/${state.entityIndex.length} entities matched ->`, matched.map((m) => m.names[0]));
     console.log(`%c[LoreFetch] Injected ${matched.length} matching entit${matched.length === 1 ? 'y' : 'ies'}.`, 'color:#45f0a0;font-weight:bold');
-    setBadgeState(
-      'success',
-      `<strong>${state.parsed.fandom}</strong>${state.parsed.arc ? ' — ' + state.parsed.arc : ''}<br>${matched.length} entit${matched.length === 1 ? 'y' : 'ies'} currently in context`
-    );
+
+    // Always show the episode/character split, not just a combined count —
+    // "0 entities" was never distinguishable from "0 episodes, 3 characters"
+    // at a glance before, which is exactly how a missing-episodes bug hid
+    // behind a green badge.
+    const episodeCount = (state.corpus.episodes || []).length;
+    const characterCount = (state.corpus.characters || []).length;
+    const counts = `${episodeCount} episode${episodeCount === 1 ? '' : 's'}, ${characterCount} character${characterCount === 1 ? '' : 's'} loaded \u2014 ${matched.length} currently in context`;
+
+    if (state.status === 'partial') {
+      setBadgeState(
+        'partial',
+        `<strong>${state.parsed.fandom}</strong>${state.parsed.arc ? ' — ' + state.parsed.arc : ''}<br>${counts}<br><span style="color:#f0b429">${state.partialReason || 'Incomplete: 0 episodes were resolved for this arc.'}</span>`
+      );
+    } else {
+      setBadgeState(
+        'success',
+        `<strong>${state.parsed.fandom}</strong>${state.parsed.arc ? ' — ' + state.parsed.arc : ''}<br>${counts}`
+      );
+    }
   }
 
   // ================= Detect chat switches =================
@@ -767,10 +844,12 @@
   // over whatever chat you've since switched to.
   let activeGeneration = 0;
 
-  function onChatOpened(chatId) {
+  function onChatOpened(chatId, opts) {
     stopRechecking();
     const myGeneration = ++activeGeneration;
     setBadgeState('working', 'Reading this chat\u2019s agent\u2026');
+    const wantsForceRefresh = !!(opts && opts.forceRefresh);
+    let forceRefreshConsumed = false;
 
     let activeState = null;
     let announcedNewChat = false;
@@ -789,7 +868,14 @@
     const tick = () => {
       if (tickInFlight) return;
       tickInFlight = true;
-      loadCorpusForChat(chatId, () => myGeneration !== activeGeneration)
+      // Only the very first tick of a load consumes the forceRefresh flag —
+      // fetchLoreCorpus's own internal batch loop already reuses the same
+      // (forceRefresh-tagged) params for every /api/lore call it makes
+      // within this one load, so this only needs to fire once per load, not
+      // once per RECHECK_INTERVAL_MS poll.
+      const useForceRefresh = wantsForceRefresh && !forceRefreshConsumed;
+      forceRefreshConsumed = true;
+      loadCorpusForChat(chatId, () => myGeneration !== activeGeneration, useForceRefresh)
         .then((result) => {
           if (myGeneration !== activeGeneration) return; // stale — a different chat is active now
           if (result.status === 'no-chat') {
@@ -804,7 +890,7 @@
             const detail = (result.warnings || []).join('<br>') || 'Could not find matching wiki content.';
             setBadgeState('error', `<strong>${result.fandom || ''}</strong><br>${detail}`);
             stopRechecking();
-          } else if (result.status === 'ready') {
+          } else if (result.status === 'ready' || result.status === 'partial') {
             activeState = result;
             clearInterval(recheckTimer);
             recheckTimer = null; // corpus is loaded — the rescan loop takes over from here
