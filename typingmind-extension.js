@@ -66,6 +66,14 @@
   const ENTITY_RESCAN_MS = 5000; // once lore is loaded, how often to re-scan the chat for mentions and refresh the injection
   const CHAT_TEXT_SCAN_MESSAGES = 40; // how many of the most recent messages to scan for character/episode mentions
   const MARKER_PREFIX = '<!-- lorefetch:'; // marks our injected block so we can find/replace it
+  // Backstop against an infinite fetch loop: if the server keeps returning
+  // done:false round after round (e.g. because the same page fails every
+  // single batch and never gets cached), this caps how many times we'll
+  // call /api/lore for one corpus load before giving up and surfacing an
+  // error, instead of polling forever in the background. BATCH_SIZE on the
+  // server is 6, so 200 rounds is room for ~1200 pages — comfortably above
+  // any real fandom's page count.
+  const MAX_LORE_BATCHES = 200;
   const HASH_POLL_MS = 500; // fallback: catch chat switches that don't fire hashchange/popstate at all
 
   // ---------- Debug ----------
@@ -237,7 +245,23 @@
     }
   }
 
-  async function fetchLoreCorpus(params, onProgress) {
+  // `isStale`, when provided, is a zero-arg function that returns true once
+  // this load is no longer wanted (i.e. the user switched to a different
+  // chat). Checked both before each network call and right after it, so a
+  // chat you've navigated away from stops making further /api/lore calls
+  // and — critically — stops invoking onProgress, instead of looping in the
+  // background indefinitely and repainting the badge for whatever chat is
+  // now actually open. Without this, switching chats never actually
+  // cancelled the old fetch loop; it just kept running (and kept hitting
+  // Fandom's API with no client-side cooldown between batches), which is
+  // also a likely contributor to unrelated wikis getting rate-limited.
+  function cancelledError() {
+    const err = new Error('cancelled: chat switched');
+    err.cancelled = true;
+    return err;
+  }
+
+  async function fetchLoreCorpus(params, onProgress, isStale) {
     // Each /api/lore call is a separate serverless invocation with its own
     // fresh `warnings` array — lore.js doesn't (and can't, statelessly)
     // persist warnings from one batch to the next. If we only kept the
@@ -246,8 +270,14 @@
     // the page intro instead") would just vanish, even though that's
     // exactly the kind of thing worth surfacing.
     const allWarnings = [];
+    let batches = 0;
     for (;;) {
+      if (isStale && isStale()) throw cancelledError();
+      if (++batches > MAX_LORE_BATCHES) {
+        throw new Error(`gave up after ${MAX_LORE_BATCHES} batches without finishing — a page is likely failing every round (check server-side warnings/logs)`);
+      }
       const result = await callLoreApiOnce(params);
+      if (isStale && isStale()) throw cancelledError(); // don't act on a response for a chat we've left
       if (result.error) throw new Error(result.error);
       if (Array.isArray(result.warnings) && result.warnings.length) allWarnings.push(...result.warnings);
       if (result.done) return { ...result, warnings: allWarnings };
@@ -583,7 +613,7 @@
   // Loads (and caches on the in-memory `state`) the full lore corpus for a
   // chat's agent, then does one entity-match/write pass. Returns nothing —
   // all outcomes are communicated via setBadgeState, same as before.
-  async function loadCorpusForChat(chatId) {
+  async function loadCorpusForChat(chatId, isStale) {
     const chatEntry = await resolveStorageKey(chatId);
     if (!chatEntry) return { status: 'no-chat' };
     const chat = chatEntry.value;
@@ -598,9 +628,14 @@
     if (!parsed || !parsed.fandom) return { status: 'skipped' };
 
     try {
-      const corpus = await fetchLoreCorpus(parsed, (progress) => {
-        setBadgeState('working', `Fetching lore\u2026 ${progress.total - progress.remaining}/${progress.total} pages`);
-      });
+      const corpus = await fetchLoreCorpus(
+        parsed,
+        (progress) => {
+          if (isStale && isStale()) return; // this chat isn't the active one anymore — don't repaint its badge
+          setBadgeState('working', `Fetching lore\u2026 ${progress.total - progress.remaining}/${progress.total} pages`);
+        },
+        isStale
+      );
       if (corpus.warnings && corpus.warnings.length) console.log('[LoreFetch] notes:', corpus.warnings);
       const entityIndex = buildEntityIndex(corpus);
       window.LoreFetchLastWarnings = corpus.warnings || [];
@@ -688,7 +723,7 @@
     const tick = () => {
       if (tickInFlight) return;
       tickInFlight = true;
-      loadCorpusForChat(chatId)
+      loadCorpusForChat(chatId, () => myGeneration !== activeGeneration)
         .then((result) => {
           if (myGeneration !== activeGeneration) return; // stale — a different chat is active now
           if (result.status === 'no-chat') {
@@ -724,6 +759,7 @@
         })
         .catch((err) => {
           if (myGeneration !== activeGeneration) return; // stale — a different chat is active now
+          if (err && err.cancelled) return; // we deliberately stopped this load; nothing to report
           console.error('[LoreFetch] load attempt failed:', err);
           setBadgeState('error', String((err && err.message) || err));
           stopRechecking();
