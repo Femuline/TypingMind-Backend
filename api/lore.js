@@ -16,6 +16,30 @@
  * depending on a generous timeout. Once nothing is missing, it returns
  * { done: true, wiki, arc, episodes, characters, warnings }.
  *
+ * PLOT vs SUMMARY — some wikis (Charmed, Buffy, Angel, ...) don't put the
+ * full plot in a section on the episode page at all; they put a one-
+ * paragraph teaser there and link out to a separate subpage, e.g.
+ * "Episode Name/Plot". fetchEpisodePlot() below tries that subpage FIRST,
+ * then a same-page Plot/Synopsis/Summary section, and only falls back to
+ * the page's short intro extract (genuinely a summary) as a last resort —
+ * flagged in warnings when that happens, since it's not what was asked for.
+ *
+ * DISAMBIGUATING SHOW VERSIONS — `media` and `year` are used for more than
+ * picking the wiki subdomain now. A lot of Fandom wikis cover a whole
+ * franchise (original + reboots + spinoffs) under ONE subdomain with a
+ * generic "Characters"/"Episodes" category that mixes every version
+ * together, alongside separately-named categories for each specific show
+ * (e.g. "Saved by the Bell Characters" for the 1989 original vs.
+ * "Saved by the Bell (2020) Characters" for the reboot, both siblings under
+ * one wiki). buildEpisodeCategoryGuesses/buildCharacterCategoryGuesses try
+ * those fandom-name-qualified (and year-qualified) category names FIRST,
+ * before ever falling back to a generic catch-all — that's what keeps a
+ * request for the 1989 show from pulling in reboot episodes/characters that
+ * happen to live in the same "Episodes"/"Characters" category on the same
+ * wiki. `media` also picks the right synonym set for what "episodes" are
+ * called for that kind of thing (Issues for a comic, Chapters for a
+ * webtoon, etc).
+ *
  * Requires a `lore_categories` table in addition to lore_wikis/lore_pages
  * (see supabase-schema.sql) — caches which pages belong to a resolved
  * Fandom category (e.g. "Season 6 Episodes") so that lookup isn't repeated
@@ -52,12 +76,27 @@ const REQUEST_TIMEOUT_MS = 8000;
 const FRESHNESS_MS = 14 * 24 * 60 * 60 * 1000; // re-fetch a page from Fandom at most every 14 days
 
 const MEDIA_TYPES = ['show', 'movie', 'game', 'comic', 'webtoon'];
+// What the "episode" equivalent is called for each media type, used to build
+// category-name guesses (see buildEpisodeCategoryGuesses). First entry in
+// each list is also what gets suffixed with "Episodes"-style qualifiers
+// (e.g. "<fandom> Issues"), so put the most likely one first.
+const MEDIA_EPISODE_SYNONYMS = {
+  show: ['Episodes', 'Episode Guide'],
+  movie: ['Movies', 'Films'],
+  game: ['Missions', 'Levels', 'Chapters'],
+  comic: ['Issues', 'Chapters'],
+  webtoon: ['Chapters', 'Episodes'],
+};
 // Fandom/Fastly has been known to quietly block requests with a generic or
 // missing User-Agent (returning a 403 or an HTML challenge page instead of
 // JSON) as basic bot protection. Sending a descriptive one avoids that.
 // TODO: swap in a real contact URL/email if you want to be extra safe here.
 const FANDOM_USER_AGENT = 'TypingMind-LoreFetch/1.0 (+https://typingmind-backend.vercel.app)';
 const PLOT_SECTION_NAMES = ['Plot', 'Synopsis', 'Summary']; // tried in this order; some wikis really do call it "Summary"
+// Some wikis put the full plot on a dedicated SUBPAGE instead of a section
+// on the main episode article (e.g. charmed.fandom.com/wiki/X/Plot) — see
+// fetchEpisodePlot. Tried in this order, before same-page sections.
+const PLOT_SUBPAGE_SUFFIXES = ['Plot', 'Synopsis'];
 const CHARACTER_SECTION_GROUPS = {
   history: ['History', 'Biography', 'Background'],
   powers: ['Powers and Abilities', 'Powers', 'Abilities'],
@@ -123,14 +162,22 @@ function slugCandidates(term, year) {
   const cleaned = term.trim().toLowerCase();
   const noArticle = cleaned.replace(/^(the|a|an)\s+/, '');
   const toSlug = (s) => s.replace(/[^a-z0-9]/g, '');
-  const candidates = [toSlug(noArticle)];
+  const bare = toSlug(noArticle);
   const withArticle = toSlug(cleaned);
-  if (withArticle !== candidates[0]) candidates.push(withArticle);
-  if (year) {
-    const withYear = `${candidates[0]}${String(year).trim()}`;
-    if (!candidates.includes(withYear)) candidates.push(withYear);
-  }
-  return candidates.filter(Boolean);
+  const candidates = [];
+  // Year-suffixed first: if a franchise has a dedicated wiki for this
+  // specific version (e.g. a reboot with its own subdomain), that's a more
+  // precise match than the bare/shared name and should win when it exists.
+  // wikiExists() just throws on a 404, so trying this first costs nothing
+  // when no such wiki exists — resolveWiki() falls through to the next
+  // candidate. This does NOT solve the more common case of one wiki
+  // covering every version of a franchise under a single bare subdomain
+  // (that's handled downstream by the fandom/year-qualified CATEGORY
+  // guesses in buildEpisodeCategoryGuesses/buildCharacterCategoryGuesses).
+  if (year) candidates.push(`${bare}${String(year).trim()}`);
+  candidates.push(bare);
+  if (withArticle !== bare) candidates.push(withArticle);
+  return [...new Set(candidates.filter(Boolean))];
 }
 
 async function wikiExists(subdomain) {
@@ -196,17 +243,77 @@ async function fetchCategoryMembers(subdomain, wikiId, categoryName, limit) {
   return titles;
 }
 
-async function findFirstNonEmptyCategory(subdomain, wikiId, candidateNames, limit) {
+// candidates may be plain strings or { name, arcScoped } objects — arcScoped
+// marks a candidate whose name already encodes a specific arc/season (e.g.
+// "Season 6 Episodes"), meaning its members don't need re-filtering by arc
+// number afterward. Plain strings are treated as arcScoped: false.
+async function findFirstNonEmptyCategory(subdomain, wikiId, candidates, limit) {
   const attempts = [];
-  for (const name of candidateNames) {
+  const seen = new Set(); // guess lists can contain duplicate names when fandom === arc, etc.
+  for (const candidate of candidates) {
+    const name = typeof candidate === 'string' ? candidate : candidate.name;
+    const arcScoped = typeof candidate === 'string' ? false : !!candidate.arcScoped;
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
     try {
       const members = await fetchCategoryMembers(subdomain, wikiId, name, limit);
-      if (members.length > 0) return { found: { name, members }, attempts };
+      if (members.length > 0) return { found: { name, arcScoped, members }, attempts };
     } catch (err) {
       attempts.push(`"${name}": ${err.message}`);
     }
   }
   return { found: null, attempts };
+}
+
+// Most-specific-first category name guesses for episodes. A wiki that hosts
+// one show has an unqualified "Episodes" category and these fandom/year-
+// qualified guesses simply won't exist — they fail fast (empty/404) and fall
+// through harmlessly. A wiki that hosts a whole franchise under one
+// subdomain is exactly the case these guesses are FOR: they let a request
+// for "Saved by the Bell" + year 1989 hit "Saved by the Bell episodes"
+// instead of a catch-all "Episodes" category that also contains the 2020
+// reboot's episodes.
+// MediaWiki only force-capitalizes the FIRST character of a page title —
+// every word after that is case-sensitive, and Fandom communities are
+// inconsistent about it (confirmed on a real wiki: "Category:X episodes"
+// lowercase right alongside "Category:X Characters" capitalized). Trying
+// only one casing of the synonym word would make these guesses miss on a
+// wiki that happens to use the other convention, so both are tried.
+function withCasings(word) {
+  return [...new Set([word, word.charAt(0).toLowerCase() + word.slice(1)])];
+}
+
+function buildEpisodeCategoryGuesses(fandom, media, year, arc) {
+  const synonyms = MEDIA_EPISODE_SYNONYMS[media] || MEDIA_EPISODE_SYNONYMS.show;
+  const primary = synonyms[0];
+  const guesses = [];
+  const addQualified = (prefix, arcScoped) => {
+    for (const word of withCasings(primary)) guesses.push({ name: `${prefix} ${word}`, arcScoped });
+  };
+  if (arc && year) addQualified(`${fandom} (${year}) ${arc}`, true);
+  if (arc) addQualified(`${fandom} ${arc}`, true);
+  if (year) addQualified(`${fandom} (${year})`, false);
+  addQualified(fandom, false);
+  if (arc) {
+    guesses.push({ name: `${arc} ${primary}`, arcScoped: true });
+    guesses.push({ name: arc, arcScoped: true });
+  }
+  for (const s of synonyms) guesses.push({ name: s, arcScoped: false });
+  return guesses;
+}
+
+// Same idea for characters. There's no arc-scoping concept for characters
+// (a character isn't "in" a season the way an episode is), so plain names
+// are enough here.
+function buildCharacterCategoryGuesses(fandom, year) {
+  const guesses = [];
+  const addQualified = (prefix) => {
+    for (const word of withCasings('Characters')) guesses.push(`${prefix} ${word}`);
+  };
+  if (year) addQualified(`${fandom} (${year})`);
+  addQualified(fandom);
+  guesses.push('Main Characters', 'Characters', 'Character');
+  return guesses;
 }
 
 function extractArcNumber(arc) {
@@ -297,14 +404,49 @@ async function fetchIntroExtract(subdomain, title) {
   return page && page.extract ? cleanExtract(page.extract) : '';
 }
 
+// Whole-page wikitext (no &section=), for subpages like "Episode/Plot" that
+// generally aren't broken into named sections at all — they're just the
+// narrative, start to finish. Throws (via apiRequest) if the page doesn't
+// exist, e.g. MediaWiki's "missingtitle" error — callers use that to know
+// this particular subpage naming isn't what this wiki uses, not that
+// anything went wrong.
+async function fetchFullPageWikitext(subdomain, title) {
+  const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=wikitext&format=json`;
+  const data = await apiRequest(url);
+  const field = data && data.parse && data.parse.wikitext;
+  const wikitext = typeof field === 'string' ? field : field && field['*'];
+  return wikitext ? cleanWikitext(wikitext) : '';
+}
+
+// Three tiers, most-complete-first:
+//   1. A dedicated "Episode Name/Plot" (or /Synopsis) subpage — this is
+//      where the FULL plot lives on wikis like Charmed's, where the main
+//      episode page only has a one-paragraph teaser and a "read the full
+//      plot here" link. This is the fix for "I'm only getting summaries."
+//   2. A same-page Plot/Synopsis/Summary section, for wikis that keep the
+//      whole thing on one article.
+//   3. The page's short lead/intro paragraph — this genuinely IS a summary,
+//      not the plot, so it's flagged in warnings rather than handed back
+//      looking equivalent to tier 1/2 content.
 async function fetchEpisodePlot(subdomain, title, warnings) {
+  for (const suffix of PLOT_SUBPAGE_SUFFIXES) {
+    try {
+      const text = await fetchFullPageWikitext(subdomain, `${title}/${suffix}`);
+      if (text) return text;
+    } catch (err) {
+      // No "<title>/<suffix>" page on this wiki — try the next suffix, then
+      // fall through to the same-page-section approach below.
+    }
+  }
+
   const sections = await fetchPageSections(subdomain, title);
   const idx = findSectionIndex(sections, PLOT_SECTION_NAMES);
   if (idx != null) {
     const text = await fetchSectionWikitext(subdomain, title, idx);
     if (text) return text;
   }
-  warnings.push(`"${title}": no Plot/Synopsis/Summary section found — used the page intro instead.`);
+
+  warnings.push(`"${title}": no Plot/Synopsis subpage or same-page section found — used the page intro instead (this is a short summary, not the full plot).`);
   return fetchIntroExtract(subdomain, title);
 }
 
@@ -400,7 +542,7 @@ export default async function handler(req, res) {
   // ---- end CORS ----
 
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-  const { fandom, year, arc } = req.body || {};
+  const { fandom, media, year, arc } = req.body || {};
   if (!fandom) return res.status(400).json({ error: 'fandom is required' });
 
   const warnings = [];
@@ -412,13 +554,12 @@ export default async function handler(req, res) {
     }
     const wiki = { subdomain: wikiRow.subdomain, sitename: wikiRow.sitename, url: wikiRow.base_url };
 
-    const episodeCategoryGuesses = arc ? [`${arc} Episodes`, `${arc}`, 'Episodes', 'Episode Guide', 'Chapters'] : ['Episodes', 'Episode Guide', 'Chapters'];
-    const arcSpecificGuesses = arc ? episodeCategoryGuesses.slice(0, 2) : [];
+    const episodeCategoryGuesses = buildEpisodeCategoryGuesses(fandom, media, year, arc);
     const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, episodeCategoryGuesses, 60);
     let episodeTitles = [];
     if (episodeCategoryResult.found) {
       episodeTitles = episodeCategoryResult.found.members;
-      if (arc && !arcSpecificGuesses.includes(episodeCategoryResult.found.name)) {
+      if (arc && !episodeCategoryResult.found.arcScoped) {
         episodeTitles = filterTitlesUpToArc(episodeTitles, arc);
         warnings.push(`No category specific to "${arc}" — filtered by number instead (best-effort).`);
       }
@@ -428,7 +569,8 @@ export default async function handler(req, res) {
       warnings.push('No episode/chapter category found on this wiki.');
     }
 
-    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, ['Main Characters', 'Characters', 'Character'], 60);
+    const characterCategoryGuesses = buildCharacterCategoryGuesses(fandom, year);
+    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, characterCategoryGuesses, 60);
     const characterTitles = characterCategoryResult.found ? characterCategoryResult.found.members : [];
     if (!characterCategoryResult.found) {
       if (characterCategoryResult.attempts.length) {
