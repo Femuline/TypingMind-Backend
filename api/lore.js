@@ -153,15 +153,16 @@ async function fetchCategoryMembers(subdomain, categoryName, limit) {
 }
 
 async function findFirstNonEmptyCategory(subdomain, candidateNames, limit) {
+  const attempts = [];
   for (const name of candidateNames) {
     try {
       const members = await fetchCategoryMembers(subdomain, name, limit);
-      if (members.length > 0) return { name, members };
+      if (members.length > 0) return { found: { name, members }, attempts };
     } catch (err) {
-      // try the next candidate
+      attempts.push(`"${name}": ${err.message}`);
     }
   }
-  return null;
+  return { found: null, attempts };
 }
 
 function extractArcNumber(arc) {
@@ -369,21 +370,29 @@ export default async function handler(req, res) {
 
     const episodeCategoryGuesses = arc ? [`${arc} Episodes`, `${arc}`, 'Episodes', 'Episode Guide', 'Chapters'] : ['Episodes', 'Episode Guide', 'Chapters'];
     const arcSpecificGuesses = arc ? episodeCategoryGuesses.slice(0, 2) : [];
-    const episodesFound = await findFirstNonEmptyCategory(wiki.subdomain, episodeCategoryGuesses, 60);
+    const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, episodeCategoryGuesses, 60);
     let episodeTitles = [];
-    if (episodesFound) {
-      episodeTitles = episodesFound.members;
-      if (arc && !arcSpecificGuesses.includes(episodesFound.name)) {
+    if (episodeCategoryResult.found) {
+      episodeTitles = episodeCategoryResult.found.members;
+      if (arc && !arcSpecificGuesses.includes(episodeCategoryResult.found.name)) {
         episodeTitles = filterTitlesUpToArc(episodeTitles, arc);
         warnings.push(`No category specific to "${arc}" — filtered by number instead (best-effort).`);
       }
+    } else if (episodeCategoryResult.attempts.length) {
+      warnings.push(`Couldn't check episode/chapter categories: ${episodeCategoryResult.attempts.join(' | ')}`);
     } else {
       warnings.push('No episode/chapter category found on this wiki.');
     }
 
-    const charactersFound = await findFirstNonEmptyCategory(wiki.subdomain, ['Main Characters', 'Characters', 'Character'], 60);
-    const characterTitles = charactersFound ? charactersFound.members : [];
-    if (!charactersFound) warnings.push('No character category found on this wiki.');
+    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, ['Main Characters', 'Characters', 'Character'], 60);
+    const characterTitles = characterCategoryResult.found ? characterCategoryResult.found.members : [];
+    if (!characterCategoryResult.found) {
+      if (characterCategoryResult.attempts.length) {
+        warnings.push(`Couldn't check character categories: ${characterCategoryResult.attempts.join(' | ')}`);
+      } else {
+        warnings.push('No character category found on this wiki.');
+      }
+    }
 
     const cachedEpisodes = await getCachedPages(wikiRow.id, 'episode', episodeTitles);
     const cachedCharacters = await getCachedPages(wikiRow.id, 'character', characterTitles);
