@@ -302,6 +302,13 @@
     // scenario, not a slow one.
     let lastProgressCount = -1;
     let stalledRounds = 0;
+    // What the last few rounds actually attempted. A page that's stuck
+    // because its fetch+cache both "succeed" (no thrown error — see the
+    // comment on getCachedEpisodes in lore.js) produces zero warnings, so
+    // warnings alone can't identify it. Remembering `attempted` lets a
+    // stall name the repeat-offending title(s) directly instead of just
+    // reporting an empty warnings list.
+    let lastAttempted = [];
     for (;;) {
       if (isStale && isStale()) throw cancelledError();
       if (++batches > MAX_LORE_BATCHES) {
@@ -316,6 +323,7 @@
         allWarnings.push(...result.warnings);
         debugLog('round warnings:', result.warnings);
       }
+      if (Array.isArray(result.attempted)) lastAttempted = result.attempted;
       if (result.done) return { ...result, warnings: allWarnings };
       debugLog(`batch progress: ${result.fetched} fetched this call, ${result.remaining} left of ${result.total}`);
       if (onProgress) onProgress(result);
@@ -324,8 +332,9 @@
       if (progressCount === lastProgressCount) {
         stalledRounds += 1;
         if (stalledRounds >= STALL_ROUNDS) {
+          const stuckOn = lastAttempted.length ? ` Stuck on: ${lastAttempted.join(' | ')}.` : '';
           const err = new Error(
-            `stuck at ${progressCount}/${result.total} for ${STALL_ROUNDS} rounds straight — one or more pages are failing every attempt, including the fallback that's supposed to cache the failure so it can be skipped. Recent warnings: ${summarizeWarnings(allWarnings)}`
+            `stuck at ${progressCount}/${result.total} for ${STALL_ROUNDS} rounds straight — one or more pages are failing every attempt, including the fallback that's supposed to cache the failure so it can be skipped.${stuckOn} Recent warnings: ${summarizeWarnings(allWarnings)}`
           );
           err.warnings = allWarnings;
           throw err;
