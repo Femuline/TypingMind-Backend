@@ -634,6 +634,30 @@ export default async function handler(req, res) {
           }
         } catch (err) {
           warnings.push(`Couldn't fetch "${item.title}": ${err.message}`);
+          // IMPORTANT: without this, a page that fails every single time
+          // (persistent 429, page doesn't exist, etc.) never leaves
+          // `missing`, so the batch loop above re-attempts it forever and
+          // `done` never flips true — the client just polls this endpoint
+          // in an infinite loop (visible as progress stuck at "total/total"
+          // since `remaining` can hit 0 while `missing` never does). Caching
+          // an empty placeholder (still upserted, still stamped with
+          // fetched_at) makes this title count as "handled" so the batch can
+          // converge; it's filtered back out of the final corpus below the
+          // same way a page with genuinely no matching sections already is.
+          // Trade-off: a failure gets cached for the full FRESHNESS_MS (14
+          // days) same as a success, so a transient failure (e.g. today's
+          // 429) won't be retried until then either — acceptable here since
+          // the alternative (never converging) is worse, but worth a shorter
+          // TTL for empty rows specifically if that turns out to matter.
+          try {
+            if (item.type === 'episode') {
+              await upsertEpisode(wikiRow.id, item.title, arc || null, '');
+            } else {
+              await upsertCharacter(wikiRow.id, item.title, {});
+            }
+          } catch (cacheErr) {
+            warnings.push(`Also couldn't cache the failure for "${item.title}": ${cacheErr.message}`);
+          }
         }
         await delay(REQUEST_DELAY_MS);
       }
