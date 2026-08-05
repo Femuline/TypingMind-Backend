@@ -256,11 +256,37 @@ const FANDOM_USER_AGENT = 'TypingMind-LoreFetch/1.0 (+https://typingmind-backend
 const PLOT_SECTION_NAMES = ['Plot', 'Synopsis', 'Summary'];
 const PLOT_SUBPAGE_SUFFIXES = ['Plot', 'Synopsis'];
 const CHARACTER_SECTION_GROUPS = {
+  personality: ['Personality', 'Personality and Traits', 'Personality Traits'],
   history: ['History', 'Biography', 'Background'],
   powers: ['Powers and Abilities', 'Powers', 'Abilities'],
-  relationships: ['Relationships'],
+  // 'Relationships' alone missed most Charmed characters — confirmed via
+  // charmed.fandom.com's own section list that the actual heading there is
+  // "Romantic Life", not "Relationships". Keeping 'Relationships' too since
+  // other wikis in this same pipeline do use that literal heading; 'Love
+  // Interests' added as a third common Fandom convention (seen used as a
+  // category name on charmed.fandom.com itself: "Category:Piper's Love
+  // Interest"), unconfirmed as a HEADING on any wiki so far — remove if it
+  // ever causes a false match.
+  relationships: ['Relationships', 'Romantic Life', 'Love Interests'],
   trivia: ['Trivia', 'Notes and Trivia', 'Notes'],
 };
+
+// Some wikis put a given field on its own dedicated SUBPAGE off the
+// character's main title instead of (or in addition to) a same-page
+// heading — confirmed on Lookism: lookism.fandom.com/wiki/<Character>/
+// Relationships is a separate page, linked from a button/tab on the
+// character's own page rather than appearing as prose there. This is the
+// character-side equivalent of PLOT_SUBPAGE_SUFFIXES for episodes. Checked
+// FIRST (see fetchCharacterBullets) for any key listed here, since a
+// dedicated subpage is a more deliberate, complete source than a same-page
+// heading would be; falls through to the same-page CHARACTER_SECTION_GROUPS
+// heading search if no subpage exists under any suffix. Only 'relationships'
+// has a confirmed subpage convention so far — add more keys here if another
+// field turns out to work the same way on some other wiki.
+const CHARACTER_SUBPAGE_SUFFIXES = {
+  relationships: ['Relationships'],
+};
+
 // Section names tried (in order — see findSectionIndex) on a SEASON page
 // itself (not a character page) to find its cast listing. "Cast and
 // Characters" is first because it's the actual heading Fandom's own TV-show
@@ -1040,16 +1066,49 @@ async function fetchCharacterBullets(subdomain, title, warnings) {
   const sections = await fetchPageSections(subdomain, title);
   const result = {};
   for (const [key, candidates] of Object.entries(CHARACTER_SECTION_GROUPS)) {
-    const idx = findSectionIndex(sections, candidates);
-    if (idx == null) continue;
-    const text = await fetchSectionWikitext(subdomain, title, idx);
+    let text = '';
+
+    // Subpage tier (e.g. "<title>/Relationships") — only checked for keys
+    // listed in CHARACTER_SUBPAGE_SUFFIXES. fetchFullPageWikitext returns ''
+    // (not a throw) for a subpage that doesn't exist, same as the episode
+    // "/Plot" and "/Synopsis" subpage check in fetchEpisodePlot, so this loop
+    // just falls through to the next suffix, then to the same-page tier
+    // below, with no special-casing needed for the "no such page" case.
+    const subpageSuffixes = CHARACTER_SUBPAGE_SUFFIXES[key];
+    if (subpageSuffixes) {
+      for (const suffix of subpageSuffixes) {
+        try {
+          text = await fetchFullPageWikitext(subdomain, `${title}/${suffix}`);
+        } catch (err) {
+          text = '';
+        }
+        if (text) break;
+      }
+    }
+
+    // Same-page heading tier — tried when no subpage suffix is configured for
+    // this key, or every configured suffix came back empty.
+    if (!text) {
+      const idx = findSectionIndex(sections, candidates);
+      if (idx != null) text = await fetchSectionWikitext(subdomain, title, idx);
+    }
+
     if (!text) continue;
     result[key] = key === 'trivia' ? linesToBullets(text) : paragraphsToBullets(text);
   }
-  if (!result.history && !result.powers && !result.relationships && !result.trivia) {
-    warnings.push(`"${title}": none of History/Powers/Relationships/Trivia were found on this page.`);
+  if (!characterHasContent(result)) {
+    warnings.push(`"${title}": none of ${Object.keys(CHARACTER_SECTION_GROUPS).join('/')} were found on this page.`);
   }
   return result;
+}
+
+// Shared "does this character row/result actually have anything in it" check
+// — used here, in the dryRun status classifier, and in the final corpus
+// assembly. Centralized so adding a new CHARACTER_SECTION_GROUPS key (like
+// 'personality') doesn't require updating a hardcoded field list in three
+// separate places.
+function characterHasContent(row) {
+  return !!(row && Object.keys(CHARACTER_SECTION_GROUPS).some((key) => row[key] && row[key].length));
 }
 
 // ================= Supabase cache =================
@@ -1133,6 +1192,7 @@ async function upsertCharacter(wikiId, title, bullets) {
     {
       wiki_id: wikiId,
       title,
+      personality: bullets.personality || [],
       history: bullets.history || [],
       powers: bullets.powers || [],
       relationships: bullets.relationships || [],
@@ -1379,8 +1439,7 @@ export default async function handler(req, res) {
       });
       const characterStatus = characterTitles.map((title) => {
         const row = rawCharacters[title];
-        const hasContent = !!(row && (row.history?.length || row.powers?.length || row.relationships?.length || row.trivia?.length));
-        return { title, status: classify(row, hasContent), fetchedAt: row ? row.fetched_at : null };
+        return { title, status: classify(row, characterHasContent(row)), fetchedAt: row ? row.fetched_at : null };
       });
       return res.status(200).json({
         dryRun: true,
@@ -1495,10 +1554,10 @@ export default async function handler(req, res) {
     const characters = [];
     for (const title of characterTitles) {
       const row = cachedCharacters[title];
-      const hasContent = !!(row && (row.history?.length || row.powers?.length || row.relationships?.length || row.trivia?.length));
-      if (hasContent) {
+      if (characterHasContent(row)) {
         characters.push({
           name: title,
+          personality: row.personality || [],
           history: row.history || [],
           powers: row.powers || [],
           relationships: row.relationships || [],
