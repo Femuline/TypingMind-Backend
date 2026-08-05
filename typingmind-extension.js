@@ -13,7 +13,12 @@
  *      TypingMind's IndexedDB (database "keyval-store", store "keyval").
  *   3. Parses out {arc, year, media, fandom} from instructions shaped
  *      like: "Portray canon characters in season 5 of the 1998 show
- *      Charmed."
+ *      Charmed." Also scans those same instructions for any number of
+ *      standalone "Also fetch the character <Name>." / "Also fetch the
+ *      episode <Title>." sentences, for pages that lore.js's automatic
+ *      category discovery might not find on its own (see extraCharacters/
+ *      extraEpisodes in lore.js's own header comment for why that gap
+ *      exists).
  *   4. Calls YOUR OWN lore API (see LORE_API_BASE below — a Vercel
  *      function backed by Supabase, api/lore.js in this same delivery)
  *      to get the full episode Plot text + character bio/powers/
@@ -247,7 +252,45 @@
     const arc = arcLabel ? `${arcLabel[0].toUpperCase()}${arcLabel.slice(1)} ${arcNumber}` : null;
     const trimmedFandom = fandom.trim();
     if (!trimmedFandom) return null;
-    return { arc, year: year || null, media: media.toLowerCase(), fandom: trimmedFandom };
+    const { extraCharacters, extraEpisodes } = parseExtraEntries(instruction);
+    return { arc, year: year || null, media: media.toLowerCase(), fandom: trimmedFandom, extraCharacters, extraEpisodes };
+  }
+
+  // ================= Manual entry overrides =================
+  // lore.js's category discovery only ever returns the DIRECT members of
+  // whichever "Characters"/"Episodes"-style category name resolves first on
+  // the wiki — it has no way to know a page exists if that page isn't filed
+  // under one of the guessed category names (Fandom's categorymembers API
+  // doesn't recurse into subcategories). A character like Hecate, filed
+  // under something like "Villains" or a per-season category instead of a
+  // wiki-wide "Charmed Characters"/"Characters" catch-all, can fall through
+  // that gap with nothing to do with arc/season filtering as such. Rather
+  // than trying to make the category-guess list exhaustive for every wiki's
+  // own tagging quirks, this lets you name an exact page and have it pulled
+  // in no matter what. One sentence per extra title, repeated as many times
+  // as needed, anywhere in the instructions text — order doesn't matter and
+  // it works fine with or without an arc clause in the main sentence:
+  //   "Also fetch the character Hecate."
+  //   "Also fetch the episode Morality Bites."
+  // The title must be the EXACT Fandom page title (what's after /wiki/ in
+  // the page's own URL, with spaces instead of underscores) — lore.js
+  // matches/caches by exact title, so a near-miss doesn't land on the page
+  // you meant, it just looks like a new page that then fails to fetch.
+  const EXTRA_ENTRY_PATTERN = /also fetch the (character|episode)\s+(.+?)\./gi;
+
+  function parseExtraEntries(instruction) {
+    const extraCharacters = [];
+    const extraEpisodes = [];
+    if (!instruction) return { extraCharacters, extraEpisodes };
+    const re = new RegExp(EXTRA_ENTRY_PATTERN.source, 'gi');
+    let m;
+    while ((m = re.exec(instruction))) {
+      const title = m[2].trim();
+      if (!title) continue;
+      if (m[1].toLowerCase() === 'character') extraCharacters.push(title);
+      else extraEpisodes.push(title);
+    }
+    return { extraCharacters, extraEpisodes };
   }
 
   // ================= Lore API (fetching/parsing/storage now all live server-side) =================
@@ -512,6 +555,11 @@
     console.log(
       `%c[LoreFetch] Episode category: ${result.episodeCategory || '(none found)'}` +
         `${result.episodeCategory ? (result.episodeCategoryArcScoped ? ' — arc-scoped' : ' — NOT arc-scoped, likely whole-series') : ''}`,
+      'color:#7dd3fc'
+    );
+    console.log(
+      `%c[LoreFetch] Character category: ${result.characterCategory || '(none found)'}` +
+        `${result.characterCategory ? (result.characterCategoryArcScoped ? ' — arc-scoped' : ' — NOT arc-scoped, likely whole-series cast') : ''}`,
       'color:#7dd3fc'
     );
     if (result.episodeStatus && result.episodeStatus.length) console.table(result.episodeStatus);
@@ -844,6 +892,28 @@
           entityIndex,
           lastMatchedKey: null,
           partialReason: `No episodes were found for "${parsed.arc}" — only character info is available. The episode category on ${corpus.wiki.sitename} likely wasn't matched (check the warnings below); run window.LoreFetchRefresh() after fixing/redeploying lore.js.`,
+        };
+      }
+      // Same idea as the episode check above, but for characters: an arc was
+      // requested, yet no category specific to that arc was found, so
+      // corpus.characters is this wiki's whole-series cast rather than just
+      // "<arc>"'s characters (lore.js can't reliably number-filter character
+      // titles the way it can episode titles — see its file header). Worth
+      // flagging on the badge, not just in the console, since a full cast
+      // list can otherwise look identical to a correctly-scoped one.
+      const characterCategoryArcScoped = corpus.characterCategoryArcScoped === true;
+      if (parsed.arc && !characterCategoryArcScoped) {
+        return {
+          status: 'partial',
+          chatKey: chatEntry.key,
+          agentId,
+          parsed,
+          corpus,
+          entityIndex,
+          lastMatchedKey: null,
+          partialReason: corpus.characterCategory
+            ? `Characters aren't scoped to "${parsed.arc}" — no character category specific to "${parsed.arc}" was found, so this is ${corpus.wiki.sitename}'s whole-series cast, not just "${parsed.arc}"'s. Episodes are still correctly scoped. Add "Also fetch the character <Name>." lines to the instructions to hand-pick specific ones instead.`
+            : `No character category was found on ${corpus.wiki.sitename} at all — no character info is available for this fandom. Check the warnings below.`,
         };
       }
       return { status: 'ready', chatKey: chatEntry.key, agentId, parsed, corpus, entityIndex, lastMatchedKey: null };
