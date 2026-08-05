@@ -61,10 +61,9 @@
  * source rather than patching each guess-builder separately. The resolved
  * title is surfaced as `arcResolvedTitle` in every response shape (null
  * when nothing needed resolving); the index page it came from is
- * `arcIndexPage`. The literal `arc` text is still what's used for: filterTitlesToArc (the
- * NUMBER-based episode fallback, which needs an actual digit — "Breakaway"
- * has none), and everything echoed back to the caller (the response's own
- * `arc` field, `arcResolvedTitle` for debugging) so a client can always see both what was asked for and what it resolved to.
+ * `arcIndexPage`. The literal `arc` text is still what's used for the
+ * NUMBER-based episode fallback filter (filterTitlesToArc, which needs an
+ * actual digit) and for everything echoed back to the caller.
  *
  * ARC SCOPING — EPISODES: when `arc` is passed, episode category guessing
  * tries arc-scoped category names first (e.g. "Charmed Season 1 Episodes",
@@ -117,14 +116,6 @@
  * was used instead, filtered for obvious non-character titles (see
  * findSeasonPageCharacters and looksLikeNonCharacterTitle) — noisier, but
  * still scoped to this season's own page rather than the wiki-wide fallback.
- * characterSource ('season-page-section' | 'season-page-whole' | 'category' |
- * 'none') says which stage actually produced the list, for debugging —
- * '-section' means a Cast/Characters-shaped heading was found and used;
- * '-whole' means the season page existed but had no such heading (or that
- * heading's own links didn't survive filtering), so every link on the page
- * was used instead, filtered for obvious non-character titles (see
- * findSeasonPageCharacters and looksLikeNonCharacterTitle) — noisier, but
- * still scoped to this season's own page rather than the wiki-wide fallback.
  *
  * NON-CHARACTER PAGE FILTERING (both stages above): neither ARC SCOPING
  * mechanism above actually verifies that a discovered link points at a
@@ -164,17 +155,16 @@
  * guessed and got right — a character filed under something the guess list
  * doesn't try at all (e.g. "Villains", "Demons", with no "Characters"-style
  * category tagging her at all) can still be silently missed, with nothing
- * to do with `arc`. Rather than trying to make the category-guess list exhaustive for every wiki's
- * own tagging quirks, this lets you name an exact page and have it pulled
- * in no matter what. One sentence per extra title, repeated as many times
- * as needed, anywhere in the instructions text — order doesn't matter and
- * it works fine with or without an arc clause in the main sentence:
- *   "Also fetch the character Hecate."
- *   "Also fetch the episode Morality Bites."
- * The title must be the EXACT Fandom page title (what's after /wiki/ in
- * the page's own URL, with spaces instead of underscores) — lore.js
- * matches/caches by exact title, so a near-miss doesn't land on the page
- * you meant, it just looks like a new page that then fails to fetch.
+ * to do with `arc`. These two arrays sidestep discovery entirely for the
+ * titles listed: each one is merged into episodeTitles/characterTitles
+ * right after discovery runs (see `normalizeExtraTitles` below) and then
+ * goes through the exact same cache-check → fetch → upsert path as every
+ * automatically-discovered title — same lore_episodes/lore_characters
+ * tables, same 14-day freshness, same forceRefresh behavior — it's just
+ * never at risk of being left out by category-matching. Titles must be the
+ * EXACT Fandom page title (what's after /wiki/ in the page's own URL,
+ * spaces instead of underscores); a near-miss doesn't match an existing
+ * row, it just looks like a brand-new page that then fails to fetch.
  * extraEpisodes entries get tagged with whichever `arc` was passed on that
  * same call (or null), same as a normally-discovered episode would be.
  *
@@ -524,7 +514,16 @@ function buildEpisodeCategoryGuesses(fandom, media, year, arc) {
 // request.
 // NOTE: this is now the FALLBACK for character discovery, used only when
 // findSeasonPageCharacters (which reads the season's own page instead of
-// guessing at a category) finds nothing — see the handler.
+// guessing at a category) finds nothing — see the handler and the ARC
+// SCOPING — CHARACTERS note in the file header.
+// One-way difference from episodes: there's no equivalent of
+// filterTitlesToArc as a fallback here. Episode titles occasionally encode
+// a season/part number ("Season 5, Episode 3"); character-page titles
+// essentially never do (a character's title is just their name) — inventing
+// a number-based filter for characters would almost always be a no-op that
+// silently claims to have scoped something it didn't. So: if no arc-scoped
+// character category exists on this wiki, the caller gets the wiki-wide cast
+// back, WITH a warning that it's unscoped, rather than a fake-precise filter.
 function buildCharacterCategoryGuesses(fandom, year, arc) {
   const arcScopedGuesses = [];
   const genericGuesses = [];
@@ -624,99 +623,27 @@ function extractArcNumber(arc) {
   return m ? parseInt(m[0], 10) : null;
 }
 
-// --- REPLACED: async, category-aware filterTitlesToArc to avoid including whole-series lists when arc scoping is intended ---
-async function filterTitlesToArc(titles, arc, subdomain, warnings) {
-  // If arc doesn't contain a number we can't meaningfully filter by digit.
+// FIX (2026-08): this used to keep every title whose encoded number was
+// <= num ("up to" the requested arc) instead of === num (just the requested
+// arc). That's a real bug, not a naming quirk: this is the fallback used
+// when NO arc-scoped category exists (see the ARC SCOPING — EPISODES note
+// in the file header) specifically to scope a wiki-wide episode list down
+// to just the one season/arc that was asked for. With <=, requesting
+// "Season 2" silently included Season 1's episodes too (and "Season 5"
+// included 1-5) — on any wiki without a clean per-season episode category,
+// e.g. Stranger Things and Saved by the Bell. Titles with NO detectable
+// number still pass through (`if (!m) return true`) since those can't be
+// judged one way or the other and dropping them would just as silently
+// under-scope the corpus instead.
+function filterTitlesToArc(titles, arc) {
   const num = extractArcNumber(arc);
   if (num == null) return titles;
-
-  // Try several common season-number patterns in the title:
-  //  - "Season 2", "(Season 2)"
-  //  - "S02", "S2E03"
-  //  - "Part 2"
-  const seasonNumberRegexes = [
-    /\b(?:season|series)\s*[:\s]*0*(\d+)\b/i,      // "Season 2", "season 02"
-    /\bS0*(\d+)(?=E|\b)/i,                         // "S02", "S02E03"
-    /\((?:Season|Series)\s*0*(\d+)\)/i,            // "(Season 2)"
-    /\bPart\s*0*(\d+)\b/i,                         // "Part 2"
-    /\bVolume\s*0*(\d+)\b/i,                       // "Volume 2"
-  ];
-
-  const seasonMatches = Object.create(null);
-  for (const title of titles) {
-    for (const rx of seasonNumberRegexes) {
-      const m = title.match(rx);
-      if (m) {
-        seasonMatches[title] = parseInt(m[1], 10);
-        break;
-      }
-    }
-  }
-
-  const titlesWithNumbers = Object.keys(seasonMatches);
-  // If some titles explicitly encode season numbers, prefer those as authoritative:
-  if (titlesWithNumbers.length > 0) {
-    const explicitMatching = titles.filter((t) => seasonMatches[t] === num);
-
-    // If there are unnumbered titles, try to inspect their page categories
-    // to see whether the page itself is categorized under the requested season.
-    const unnumbered = titles.filter((t) => seasonMatches[t] === undefined);
-    let matchedFromCategories = [];
-    if (unnumbered.length && subdomain) {
-      try {
-        const byTitle = await fetchCategoriesForTitles(subdomain, unnumbered);
-        const seasonLabel = `season ${num}`;
-        const arcLower = String(arc).toLowerCase();
-        matchedFromCategories = unnumbered.filter((t) => {
-          const cats = byTitle[t] || [];
-          return cats.some((c) => {
-            const lc = c.toLowerCase();
-            return lc.includes(seasonLabel) || lc.includes(arcLower) || lc.includes(String(num));
-          });
-        });
-      } catch (err) {
-        if (warnings) warnings.push(`Could not inspect page categories for arc filtering: ${err.message}`);
-      }
-    }
-
-    // Combine explicit numeric matches + any unnumbered pages whose categories
-    // explicitly indicate the requested arc/season.
-    const result = [...explicitMatching, ...matchedFromCategories];
-    // Deduplicate and preserve input order:
-    const seen = new Set();
-    return titles.filter((t) => {
-      if (!result.includes(t)) return false;
-      if (seen.has(t)) return false;
-      seen.add(t);
-      return true;
-    });
-  }
-
-  // No titles provided an explicit season number. Try a category-based heuristic
-  // across all titles: keep any whose page categories mention the arc/season.
-  if (subdomain) {
-    try {
-      const byTitle = await fetchCategoriesForTitles(subdomain, titles);
-      const seasonLabel = `season ${num}`;
-      const arcLower = String(arc).toLowerCase();
-      const keep = titles.filter((title) => {
-        const cats = byTitle[title] || [];
-        return cats.some((c) => {
-          const lc = c.toLowerCase();
-          return lc.includes(seasonLabel) || lc.includes(arcLower) || lc.includes(String(num));
-        });
-      });
-      if (keep.length) return keep;
-    } catch (err) {
-      if (warnings) warnings.push(`Could not inspect page categories for arc filtering: ${err.message}`);
-    }
-  }
-
-  // Nothing reliable found — fall back to the original no-op behavior so the
-  // caller's existing "no matches" handling/warning still applies.
-  return titles;
+  return titles.filter((title) => {
+    const m = title.match(/(?:season|s|arc|part|book|volume)\s*0*(\d+)/i);
+    if (!m) return true;
+    return parseInt(m[1], 10) === num;
+  });
 }
-// --- END replacement ---
 
 function cleanExtract(text) {
   return text
@@ -785,7 +712,7 @@ async function fetchSectionWikitext(subdomain, title, sectionIndex) {
 // a season page's Cast/Characters section as a list of character-page
 // titles, without us having to hand-roll a [[...]] regex over wikitext
 // (which would also have to duplicate cleanWikitext's template/ref
-// stripping to avoid false hits inside {{...}}).
+// stripping to avoid false hits inside {{...}} navboxes).
 async function fetchSectionLinks(subdomain, title, sectionIndex) {
   const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=links&section=${sectionIndex}&redirects=1&format=json`;
   const data = await apiRequest(url);
@@ -856,7 +783,10 @@ function looksLikeNonCharacterTitle(title, seasonPageTitle) {
 // "Characters" category (see buildCharacterCategoryGuesses's own comment).
 // Reading the season page's own cast listing sidesteps that gap: it's
 // exactly the character list a human reading that page would see, scoped to
-// that season by construction rather than by our noise filter.
+// that season by construction rather than by a category-name guess.
+// Category-based discovery (buildCharacterCategoryGuesses) is the FALLBACK
+// for this now, used only when every page guess here comes back empty — see
+// the handler.
 async function findSeasonPageCharacters(subdomain, pageGuesses, warnings) {
   for (const pageTitle of pageGuesses) {
     let sections;
@@ -1384,8 +1314,7 @@ export default async function handler(req, res) {
       episodeTitles = episodeCategoryResult.found.members;
       if (arc && !episodeCategoryResult.found.arcScoped) {
         const beforeCount = episodeTitles.length;
-        // Use the new async, category-aware filter:
-        episodeTitles = await filterTitlesToArc(episodeTitles, arc, wiki.subdomain, warnings);
+        episodeTitles = filterTitlesToArc(episodeTitles, arc);
         warnings.push(
           `No category specific to "${resolvedArc}"${resolvedArc !== arc ? ` (resolved from "${arc}")` : ''} — filtered "${arc}" by number instead (best-effort).`
         );
