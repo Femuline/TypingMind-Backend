@@ -558,8 +558,14 @@
       'color:#7dd3fc'
     );
     console.log(
-      `%c[LoreFetch] Character category: ${result.characterCategory || '(none found)'}` +
-        `${result.characterCategory ? (result.characterCategoryArcScoped ? ' — arc-scoped' : ' — NOT arc-scoped, likely whole-series cast') : ''}`,
+      `%c[LoreFetch] Character source: ${result.characterCategory || '(none found)'}` +
+        `${result.characterCategory ? (result.characterCategoryArcScoped ? ' — arc-scoped' : ' — NOT arc-scoped, likely whole-series cast') : ''}` +
+        // characterSource is new (see lore.js): 'season-page' means this list came
+        // from reading the season's own Cast/Characters section (the accurate,
+        // preferred path); 'category' means it fell back to guessing a separate
+        // "<arc> Characters"-style category page instead — worth knowing which one
+        // fired when checking whether a scoped result can be trusted.
+        `${result.characterSource ? ` [source: ${result.characterSource}]` : ''}`,
       'color:#7dd3fc'
     );
     if (result.episodeStatus && result.episodeStatus.length) console.table(result.episodeStatus);
@@ -895,12 +901,13 @@
         };
       }
       // Same idea as the episode check above, but for characters: an arc was
-      // requested, yet no category specific to that arc was found, so
+      // requested, yet neither lore.js's season-page read nor its category
+      // guess turned up an arc-scoped source (see characterSource/the ARC
+      // SCOPING — CHARACTERS note in lore.js's file header), so
       // corpus.characters is this wiki's whole-series cast rather than just
-      // "<arc>"'s characters (lore.js can't reliably number-filter character
-      // titles the way it can episode titles — see its file header). Worth
-      // flagging on the badge, not just in the console, since a full cast
-      // list can otherwise look identical to a correctly-scoped one.
+      // "<arc>"'s characters. Worth flagging on the badge, not just in the
+      // console, since a full cast list can otherwise look identical to a
+      // correctly-scoped one.
       const characterCategoryArcScoped = corpus.characterCategoryArcScoped === true;
       if (parsed.arc && !characterCategoryArcScoped) {
         return {
@@ -912,8 +919,8 @@
           entityIndex,
           lastMatchedKey: null,
           partialReason: corpus.characterCategory
-            ? `Characters aren't scoped to "${parsed.arc}" — no character category specific to "${parsed.arc}" was found, so this is ${corpus.wiki.sitename}'s whole-series cast, not just "${parsed.arc}"'s. Episodes are still correctly scoped. Add "Also fetch the character <Name>." lines to the instructions to hand-pick specific ones instead.`
-            : `No character category was found on ${corpus.wiki.sitename} at all — no character info is available for this fandom. Check the warnings below.`,
+            ? `Characters aren't scoped to "${parsed.arc}" — no season page (with a Cast/Characters section) or category specific to "${parsed.arc}" was found, so this is ${corpus.wiki.sitename}'s whole-series cast, not just "${parsed.arc}"'s. Episodes are still correctly scoped. Add "Also fetch the character <Name>." lines to the instructions to hand-pick specific ones instead.`
+            : `No season page or character category was found on ${corpus.wiki.sitename} at all — no character info is available for this fandom. Check the warnings below.`,
         };
       }
       return { status: 'ready', chatKey: chatEntry.key, agentId, parsed, corpus, entityIndex, lastMatchedKey: null };
