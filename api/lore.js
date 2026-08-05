@@ -1,7 +1,7 @@
 /**
  * lore.js
  * ---------------------------------------------------------------
- * POST { fandom, media?, year?, arc?, forceRefresh?, dryRun? }
+ * POST { fandom, media?, year?, arc?, forceRefresh?, dryRun?, extraCharacters?, extraEpisodes? }
  *
  * forceRefresh: true bypasses the 14-day category/episode/character cache
  * for this call, forcing every page and category to be re-resolved against
@@ -28,18 +28,60 @@
  * live badge or a manual dashboard query might be.
  *
  * Every response (done:true OR done:false) now also includes
- * episodesRequested (how many episode titles were actually resolved for
- * this arc — 0 is a valid but meaningful number: it means the episode
- * category was never found/matched, NOT that the arc has no episodes) and
- * episodeCategory/episodeCategoryArcScoped (which Fandom category won, and
- * whether it was scoped to the requested arc or a wiki-wide fallback).
- * done:true no longer means "found everything" by itself — it only means
- * "nothing is left in `missing`," which is trivially true if episodesRequested
- * came back 0. Check episodesRequested to tell those apart.
+ * episodesRequested/episodeCategory/episodeCategoryArcScoped AND
+ * charactersRequested/characterCategory/characterCategoryArcScoped — for
+ * each: how many titles were actually resolved (0 is a valid but meaningful
+ * number: it means no matching category was ever found/matched, NOT that
+ * the arc has no episodes/characters), which Fandom category won, and
+ * whether that category was scoped to the requested `arc` or is a
+ * wiki-wide fallback covering every season. done:true no longer means
+ * "found everything" by itself — it only means "nothing is left in
+ * `missing`," which is trivially true if episodesRequested/
+ * charactersRequested came back 0. Check the *Requested fields to tell
+ * those apart.
+ *
+ * ARC SCOPING — when `arc` is passed, BOTH episode and character category
+ * guessing try arc-scoped category names first (e.g. "Charmed Season 1
+ * Characters", "Season 1 Characters") before ever falling back to a
+ * wiki-wide "Episodes"/"Characters" catch-all — see
+ * buildEpisodeCategoryGuesses/buildCharacterCategoryGuesses. If an
+ * arc-scoped category is found, its members are used as-is: that's a real,
+ * exact scope to the requested season/arc, not a heuristic. If NO
+ * arc-scoped category exists on the wiki, episodes fall back to a
+ * best-effort NUMBER filter on the wiki-wide list (see
+ * filterTitlesUpToArc) — but characters do NOT get an equivalent filter,
+ * because character-page titles essentially never encode a season number
+ * the way some episode titles do, so a title-based filter there would
+ * almost always be a silent no-op masquerading as scoping. In that
+ * fallback case the response's characterCategoryArcScoped is false and a
+ * warning explicitly says the character list is the whole-series cast, not
+ * scoped to `arc` — check warnings/characterCategoryArcScoped rather than
+ * assuming a returned character list is automatically limited to the arc
+ * you asked for.
  *
  * Resolves the Fandom wiki for `fandom`, figures out which episode/character
  * pages belong to `arc` (e.g. "Season 6"), and makes sure each one is cached
  * in Supabase (lore_wikis / lore_characters / lore_episodes / lore_categories).
+ *
+ * extraCharacters / extraEpisodes: optional arrays of exact Fandom page
+ * titles to fetch and cache NO MATTER what the automatic category discovery
+ * above finds (or fails to find). Even with arc-aware character discovery
+ * (above), category discovery only ever looks at whichever category name it
+ * guessed and got right — a character filed under something the guess list
+ * doesn't try at all (e.g. "Villains", "Demons", with no "Characters"-style
+ * category tagging her at all) can still be silently missed, with nothing
+ * to do with `arc`. These two arrays sidestep discovery entirely for the
+ * titles listed: each one is merged into episodeTitles/characterTitles
+ * right after discovery runs (see `normalizeExtraTitles` below) and then
+ * goes through the exact same cache-check → fetch → upsert path as every
+ * automatically-discovered title — same lore_episodes/lore_characters
+ * tables, same 14-day freshness, same forceRefresh behavior — it's just
+ * never at risk of being left out by category-matching. Titles must be the
+ * EXACT Fandom page title (what's after /wiki/ in the page's own URL,
+ * spaces instead of underscores); a near-miss doesn't match an existing
+ * row, it just looks like a brand-new page that then fails to fetch.
+ * extraEpisodes entries get tagged with whichever `arc` was passed on that
+ * same call (or null), same as a normally-discovered episode would be.
  *
  * IMPORTANT — this only ever does a small BATCH_SIZE of page fetches per
  * call, then returns { done: false, fetched, remaining, total } so the
@@ -139,6 +181,24 @@ const ALLOWED_ORIGINS = ['https://www.typingmind.com'];
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Trims, drops empties, and dedupes a client-supplied list of exact page
+// titles (extraCharacters/extraEpisodes). Anything that isn't a string is
+// silently dropped rather than thrown on, since this only ever adds titles
+// to a list — a malformed entry should just be a no-op, not a 500.
+function normalizeExtraTitles(list) {
+  if (!Array.isArray(list)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of list) {
+    const title = typeof raw === 'string' ? raw.trim() : '';
+    if (title && !seen.has(title)) {
+      seen.add(title);
+      out.push(title);
+    }
+  }
+  return out;
 }
 
 function applyCors(req, res) {
@@ -308,15 +368,33 @@ function buildEpisodeCategoryGuesses(fandom, media, year, arc) {
   return [...arcScopedGuesses, ...genericGuesses];
 }
 
-function buildCharacterCategoryGuesses(fandom, year) {
-  const guesses = [];
-  const addQualified = (prefix) => {
-    for (const word of withCasings('Characters')) guesses.push(`${prefix} ${word}`);
+// Character-category counterpart to buildEpisodeCategoryGuesses above — same
+// "collect every arc-scoped guess first, exhaust those, THEN fall back to
+// generic" ordering, for the same reason: a wiki-wide "Characters" category
+// resolving before a real "Season 1 Characters" one would otherwise win by
+// accident and silently hand back the whole-series cast for an arc-specific
+// request.
+// One-way difference from episodes: there's no equivalent of
+// filterTitlesUpToArc as a fallback here. Episode titles occasionally encode
+// a season/part number ("Season 5, Episode 3"); character-page titles
+// essentially never do (a character's title is just their name) — inventing
+// a number-based filter for characters would almost always be a no-op that
+// silently claims to have scoped something it didn't. So: if no arc-scoped
+// character category exists on this wiki, the caller gets the wiki-wide cast
+// back, WITH a warning that it's unscoped, rather than a fake-precise filter.
+function buildCharacterCategoryGuesses(fandom, year, arc) {
+  const arcScopedGuesses = [];
+  const genericGuesses = [];
+  const addQualified = (list, prefix, arcScoped) => {
+    for (const word of withCasings('Characters')) list.push({ name: `${prefix} ${word}`, arcScoped });
   };
-  if (year) addQualified(`${fandom} (${year})`);
-  addQualified(fandom);
-  guesses.push('Main Characters', 'Characters', 'Character');
-  return guesses;
+  if (arc && year) addQualified(arcScopedGuesses, `${fandom} (${year}) ${arc}`, true);
+  if (arc) addQualified(arcScopedGuesses, `${fandom} ${arc}`, true);
+  if (arc) addQualified(arcScopedGuesses, arc, true);
+  if (year) addQualified(genericGuesses, `${fandom} (${year})`, false);
+  addQualified(genericGuesses, fandom, false);
+  genericGuesses.push({ name: 'Main Characters', arcScoped: false }, { name: 'Characters', arcScoped: false }, { name: 'Character', arcScoped: false });
+  return [...arcScopedGuesses, ...genericGuesses];
 }
 
 function extractArcNumber(arc) {
@@ -560,7 +638,7 @@ export default async function handler(req, res) {
   }
 
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-  const { fandom, media, year, arc, forceRefresh, dryRun } = req.body || {};
+  const { fandom, media, year, arc, forceRefresh, dryRun, extraCharacters, extraEpisodes } = req.body || {};
   if (!fandom) return res.status(400).json({ error: 'fandom is required' });
 
   // forceRefresh: true bypasses the 14-day lore_categories/lore_episodes/
@@ -613,14 +691,47 @@ export default async function handler(req, res) {
       warnings.push(`No episodes were resolved for "${arc}" specifically — the corpus for this arc will contain 0 episodes even though the request will still report done:true once characters are handled.`);
     }
 
-    const characterCategoryGuesses = buildCharacterCategoryGuesses(fandom, year);
+    // Manual override: pages listed here are fetched/cached regardless of
+    // what category discovery just did above, and regardless of the
+    // arc-number filter applied to episodeTitles a few lines up — see the
+    // extraCharacters/extraEpisodes doc block at the top of this file.
+    const extraEpisodeTitles = normalizeExtraTitles(extraEpisodes);
+    if (extraEpisodeTitles.length) {
+      const have = new Set(episodeTitles);
+      const added = extraEpisodeTitles.filter((title) => !have.has(title));
+      episodeTitles.push(...added);
+      if (added.length) {
+        warnings.push(`${added.length} episode title(s) added manually via extraEpisodes (bypassing category discovery): ${added.join(', ')}`);
+      }
+    }
+
+    const characterCategoryGuesses = buildCharacterCategoryGuesses(fandom, year, arc);
     const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, characterCategoryGuesses, 500, freshnessMs);
-    const characterTitles = characterCategoryResult.found ? characterCategoryResult.found.members : [];
-    if (!characterCategoryResult.found) {
-      if (characterCategoryResult.attempts.length) {
-        warnings.push(`Couldn't check character categories: ${characterCategoryResult.attempts.join(' | ')}`);
-      } else {
-        warnings.push('No character category found on this wiki.');
+    let characterCategoryArcScoped = false;
+    // Copy (don't reference) `.members` — that array may be the same object
+    // returned from the category cache, and this function is about to push
+    // extra titles onto characterTitles below.
+    let characterTitles = characterCategoryResult.found ? [...characterCategoryResult.found.members] : [];
+    if (characterCategoryResult.found) {
+      characterCategoryArcScoped = characterCategoryResult.found.arcScoped;
+      if (arc && !characterCategoryArcScoped) {
+        warnings.push(
+          `No character category specific to "${arc}" was found — falling back to this wiki's whole-series cast ("${characterCategoryResult.found.name}"), NOT just "${arc}". Character-page titles essentially never encode a season/arc number the way some episode titles do, so there's no reliable way to filter this list down automatically the way episodes get filtered above. Treat the character corpus as unscoped; use extraCharacters to hand-pick titles if you only want specific ones from this arc.`
+        );
+      }
+    } else if (characterCategoryResult.attempts.length) {
+      warnings.push(`Couldn't check character categories: ${characterCategoryResult.attempts.join(' | ')}`);
+    } else {
+      warnings.push('No character category found on this wiki.');
+    }
+
+    const extraCharacterTitles = normalizeExtraTitles(extraCharacters);
+    if (extraCharacterTitles.length) {
+      const have = new Set(characterTitles);
+      const added = extraCharacterTitles.filter((title) => !have.has(title));
+      characterTitles.push(...added);
+      if (added.length) {
+        warnings.push(`${added.length} character title(s) added manually via extraCharacters (bypassing category discovery): ${added.join(', ')}`);
       }
     }
 
@@ -667,6 +778,8 @@ export default async function handler(req, res) {
         episodeStatus,
         missingEpisodes: episodeStatus.filter((e) => e.status !== 'ok').map((e) => e.title),
         charactersRequested: characterTitles.length,
+        characterCategory: characterCategoryResult.found ? characterCategoryResult.found.name : null,
+        characterCategoryArcScoped,
         characterStatus,
         missingCharacters: characterStatus.filter((c) => c.status !== 'ok').map((c) => c.title),
         warnings,
@@ -725,6 +838,9 @@ export default async function handler(req, res) {
         episodesRequested: episodeTitles.length,
         episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
         episodeCategoryArcScoped,
+        charactersRequested: characterTitles.length,
+        characterCategory: characterCategoryResult.found ? characterCategoryResult.found.name : null,
+        characterCategoryArcScoped,
         warnings,
       });
     }
@@ -768,6 +884,9 @@ export default async function handler(req, res) {
       episodesRequested: episodeTitles.length,
       episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
       episodeCategoryArcScoped,
+      charactersRequested: characterTitles.length,
+      characterCategory: characterCategoryResult.found ? characterCategoryResult.found.name : null,
+      characterCategoryArcScoped,
       warnings,
     });
   } catch (err) {
