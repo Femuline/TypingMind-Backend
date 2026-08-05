@@ -27,7 +27,10 @@
  * that doesn't match what upsertEpisode actually wrote, etc.) the way a
  * live badge or a manual dashboard query might be.
  *
- * Every response (done:true OR done:false) now also includes
+ * Every response (done:true OR done:false) now also includes arc/
+ * arcResolvedTitle/arcIndexPage (see ARC INDEX RESOLUTION below —
+ * arcResolvedTitle/arcIndexPage are null unless a numbered `arc` actually
+ * got resolved to a real title via the wiki's own index page) AND
  * episodesRequested/episodeCategory/episodeCategoryArcScoped AND
  * charactersRequested/characterCategory/characterCategoryArcScoped/
  * characterSource — for each: how many titles were actually resolved (0 is
@@ -41,6 +44,27 @@
  * charactersRequested came back 0. Check the *Requested fields to tell
  * those apart.
  *
+ * ARC INDEX RESOLUTION: before any of the scoping below runs, a numbered
+ * `arc` (e.g. "Arc 2") is checked against a wiki-wide INDEX page, if the
+ * wiki has one — see resolveArcTitleFromIndex/buildArcIndexPageGuesses/
+ * parseArcIndexWikitext. This exists for wikis that name their arcs/seasons/
+ * volumes with real titles instead of numbers (Lookism is the motivating
+ * example: https://lookism.fandom.com/wiki/Arc_Guide numbers its arcs, but
+ * arc 2 is actually titled "Breakaway" — no page or category on that wiki is
+ * ever literally called "Arc 2"). Every "<Label> N"-shaped guess below
+ * (episode category, character category, season page) is built from the
+ * literal `arc` text, so on a wiki like that none of them can ever match
+ * anything — episode scoping in particular then falls all the way through
+ * to the wiki-wide catch-all category, silently returning the WHOLE series
+ * instead of just the one arc that was asked for. Resolving "Arc 2" to
+ * "Breakaway" first, and using THAT for guess-building, fixes it at the
+ * source rather than patching each guess-builder separately. The resolved
+ * title is surfaced as `arcResolvedTitle` in every response shape (null
+ * when nothing needed resolving); the index page it came from is
+ * `arcIndexPage`. The literal `arc` text is still what's used for the
+ * NUMBER-based episode fallback filter (filterTitlesUpToArc, which needs an
+ * actual digit) and for everything echoed back to the caller.
+ *
  * ARC SCOPING — EPISODES: when `arc` is passed, episode category guessing
  * tries arc-scoped category names first (e.g. "Charmed Season 1 Episodes",
  * "Season 1 Episodes") before ever falling back to a wiki-wide "Episodes"
@@ -52,30 +76,46 @@
  *
  * ARC SCOPING — CHARACTERS: characters are scoped differently, in two
  * stages (see findSeasonPageCharacters / buildCharacterCategoryGuesses,
- * called in that order from the handler):
+ * called in that order from the handler). Stage 1 itself has two tiers:
  *   1. SEASON PAGE (primary): fetch the season's own Fandom page (e.g.
  *      "Season 6" — see buildSeasonPageGuesses) and read the character
- *      links out of its Cast/Characters section. This is tried first
- *      because real single-show wikis commonly give a season a proper cast
- *      listing on its own page without ALSO filing those same characters
- *      under a matching per-season CATEGORY — which is exactly what made
- *      stage 2 below so often land on the wiki's entire cast instead of
- *      just this arc's.
- *   2. CATEGORY guessing (fallback, only if stage 1 found nothing): tries
- *      arc-scoped category names first (e.g. "Charmed Season 1 Characters",
- *      "Season 1 Characters") before ever falling back to a wiki-wide
- *      "Characters" catch-all. Characters do NOT get a NUMBER-filter
- *      fallback the way episodes do (see filterTitlesUpToArc), because
- *      character-page titles essentially never encode a season number the
- *      way some episode titles do — a title-based filter there would almost
- *      always be a silent no-op masquerading as scoping.
+ *      links off of it. This is tried first because real single-show wikis
+ *      commonly give a season a proper cast listing on its own page without
+ *      ALSO filing those same characters under a matching per-season
+ *      CATEGORY — which is exactly what made stage 2 below so often land on
+ *      the wiki's entire cast instead of just this arc's.
+ *        a. Section tier (precise): if the page has a Cast/Characters-shaped
+ *           heading (see SEASON_CHARACTER_SECTION_NAMES), read the links out
+ *           of just that section.
+ *        b. Whole-page tier (broad fallback): if the page exists but tier
+ *           (a) found nothing — no matching heading, or that section's links
+ *           didn't survive filtering — read every internal link on the page
+ *           instead, filtered through looksLikeNonCharacterTitle. This
+ *           covers wikis that put a season's cast in an infobox field or
+ *           under a heading not in the guess list. Noisier than (a), but
+ *           still THIS season's own page rather than a wiki-wide fallback.
+ *   2. CATEGORY guessing (fallback, only if stage 1 found nothing at all —
+ *      neither tier, on any page guess): tries arc-scoped category names
+ *      first (e.g. "Charmed Season 1 Characters", "Season 1 Characters")
+ *      before ever falling back to a wiki-wide "Characters" catch-all.
+ *      Characters do NOT get a NUMBER-filter fallback the way episodes do
+ *      (see filterTitlesUpToArc), because character-page titles essentially
+ *      never encode a season number the way some episode titles do — a
+ *      title-based filter there would almost always be a silent no-op
+ *      masquerading as scoping.
  * If NEITHER stage finds an arc-scoped source, the response's
  * characterCategoryArcScoped is false and a warning explicitly says the
  * character list is the whole-series cast, not scoped to `arc` — check
  * warnings/characterCategoryArcScoped rather than assuming a returned
  * character list is automatically limited to the arc you asked for.
- * characterSource ('season-page' | 'category' | 'none') says which stage
- * actually produced the list, for debugging.
+ * characterSource ('season-page-section' | 'season-page-whole' | 'category' |
+ * 'none') says which stage actually produced the list, for debugging —
+ * '-section' means a Cast/Characters-shaped heading was found and used;
+ * '-whole' means the season page existed but had no such heading (or that
+ * heading's own links didn't survive filtering), so every link on the page
+ * was used instead, filtered for obvious non-character titles (see
+ * findSeasonPageCharacters and looksLikeNonCharacterTitle) — noisier, but
+ * still scoped to this season's own page rather than the wiki-wide fallback.
  *
  * Resolves the Fandom wiki for `fandom`, figures out which episode/character
  * pages belong to `arc` (e.g. "Season 6"), and makes sure each one is cached
@@ -447,6 +487,65 @@ function buildSeasonPageGuesses(fandom, year, arc) {
   return [...new Set(guesses.filter(Boolean))];
 }
 
+// Candidate page titles for a wiki-wide arc/season INDEX page — a single
+// page listing every arc/season in order (the motivating example is
+// Lookism's own "Arc Guide": https://lookism.fandom.com/wiki/Arc_Guide).
+// This is a DIFFERENT thing from buildSeasonPageGuesses above: that guesses
+// at ONE season's own page (e.g. "Season 6"); this guesses at the single
+// page that lists ALL of them, for wikis where individual arcs/seasons
+// aren't numbered at all — they just have real names ("Breakaway", not
+// "Arc 2") — so no guess built from the literal "<Label> N" text could ever
+// match anything on such a wiki. Only tried by resolveArcTitleFromIndex,
+// which uses whichever of these hits to translate "Arc 2" into "Breakaway"
+// before any of the OTHER guess-builders in this file ever run.
+function buildArcIndexPageGuesses(fandom, year, arcLabel) {
+  if (!arcLabel) return [];
+  const cap = arcLabel.charAt(0).toUpperCase() + arcLabel.slice(1).toLowerCase();
+  const guesses = [];
+  if (year) guesses.push(`${fandom} (${year}) ${cap} Guide`);
+  guesses.push(`${fandom} ${cap} Guide`);
+  guesses.push(`${cap} Guide`);
+  guesses.push(`List of ${cap}s`);
+  guesses.push(`${cap}s`);
+  return [...new Set(guesses.filter(Boolean))];
+}
+
+// Parses an arc/season INDEX page's raw wikitext (see buildArcIndexPageGuesses
+// above) into an ordered array of resolved page titles — entries[0] is
+// "arc 1", entries[1] is "arc 2", etc. — so resolveArcTitleFromIndex can pick
+// out entry N by plain array index, the same way a human counting down a
+// rendered numbered list would.
+//
+// Counts wikitext's OWN numbering: a run of consecutive top-level "# ..."
+// lines (MediaWiki's numbered-list syntax — this is what renders as the <ol>
+// on the page). Deliberately does NOT look for a number written inside the
+// line's own text, because there usually isn't one (that's the whole
+// problem this feature exists to solve) — the line's POSITION in the list is
+// the only thing that reliably means "arc N". Nested/indented sub-bullets
+// some wikis use for asides ("##", "#*", "#:") are skipped so they can't
+// throw off the count.
+//
+// For each top-level line, prefers the wikilink's TARGET over its display
+// text: on Lookism's own guide, entry #5 displays "Jay Hong" but actually
+// links to the page "Jay Arc" — every OTHER guess-builder in this file needs
+// that real page/category name, not the human-friendly label shown next to
+// it. Falls back to the line's own plain text (with '' / ''' bold-italic
+// markup stripped) for an entry that has no link at all yet — e.g. the last,
+// not-yet-written entry on Lookism's guide — since that's no less useful
+// than refusing to resolve it at all.
+function parseArcIndexWikitext(wikitext) {
+  const entries = [];
+  for (const rawLine of wikitext.split('\n')) {
+    const m = rawLine.match(/^#(?![#*:])\s*(.*)$/);
+    if (!m) continue;
+    const line = m[1];
+    const linkMatch = line.match(/\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/);
+    const title = (linkMatch ? linkMatch[1] : line.replace(/'{2,}/g, '')).trim();
+    entries.push(title);
+  }
+  return entries;
+}
+
 function extractArcNumber(arc) {
   if (!arc) return null;
   const m = String(arc).match(/\d+/);
@@ -457,7 +556,7 @@ function filterTitlesUpToArc(titles, arc) {
   const num = extractArcNumber(arc);
   if (num == null) return titles;
   return titles.filter((title) => {
-    const m = title.match(/(?:season|s|arc|part|book)\s*0*(\d+)/i);
+    const m = title.match(/(?:season|s|arc|part|book|volume)\s*0*(\d+)/i);
     if (!m) return true;
     return parseInt(m[1], 10) <= num;
   });
@@ -541,6 +640,29 @@ async function fetchSectionLinks(subdomain, title, sectionIndex) {
     .filter(Boolean);
 }
 
+// Same idea as fetchSectionLinks, but for the whole page instead of one
+// section — used by findSeasonPageCharacters as a broader fallback when a
+// season page exists but doesn't have a Cast/Characters-shaped section
+// findSectionIndex can identify (see SEASON_CHARACTER_SECTION_NAMES). Some
+// wikis put a season's starring cast in the page's infobox instead of a
+// prose section, or as a bare paragraph/table under a heading not in that
+// list. Note this reads links from the PARSED (rendered) page, same as
+// fetchSectionLinks — so, unlike the wikitext-based fetchFullPageWikitext
+// used for episode plots, it correctly picks up infobox-embedded links
+// (which live inside a {{...}} template call and would otherwise get
+// stripped by cleanWikitext's template-removal pass), at the cost of also
+// picking up footer nav-template links (e.g. "other seasons") that
+// looksLikeNonCharacterTitle has to filter back out.
+async function fetchAllPageLinks(subdomain, title) {
+  const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=links&redirects=1&format=json`;
+  const data = await apiRequest(url);
+  const links = (data && data.parse && data.parse.links) || [];
+  return links
+    .filter((l) => l.ns === 0)
+    .map((l) => (typeof l['*'] === 'string' ? l['*'] : l.title))
+    .filter(Boolean);
+}
+
 // A season page's Cast/Characters section can carry a small number of
 // wikilinks that aren't character pages even though they sit right next to
 // ones that are — most commonly a self-link back to the season page itself
@@ -551,9 +673,20 @@ async function fetchSectionLinks(subdomain, title, sectionIndex) {
 // which is the backstop for anything that slips past this — e.g. an actor's
 // own bio page linked from the same section, which this name-shape check
 // can't catch).
+//
+// Also used (more heavily) by findSeasonPageCharacters' whole-page fallback
+// tier below, where there's no section boundary doing any filtering for us —
+// every internal link the page has, including footer nav templates ("other
+// seasons", "other arcs"/"volumes" for franchises that use that word instead)
+// and misc wiki-housekeeping pages, comes through. The extra patterns here
+// (volume/book/arc/chapter/issue/part + number, and common non-character
+// page types) target exactly that noise. Still allow-list by exclusion
+// rather than inclusion — a real character named e.g. "Book" or "Part" is
+// vanishingly unlikely, whereas trying to positively identify "this looks
+// like a person's name" is far more error-prone across different fandoms.
 function looksLikeNonCharacterTitle(title, seasonPageTitle) {
   if (title === seasonPageTitle) return true;
-  return /^(list of|category:|season\s*\d|episode\s*\d)/i.test(title);
+  return /^(list of|category:|season\s*\d|episode\s*\d|volume\s*\d|book\s*\d|arc\s*\d|chapter\s*\d|issue\s*\d|part\s*\d|main page|timeline|soundtrack|gallery|transcript|script|merchandise|novelization|dvd|home video|blu-ray|trivia)/i.test(title);
 }
 
 // PRIMARY character-discovery strategy when an arc/season is requested: go
@@ -579,20 +712,49 @@ async function findSeasonPageCharacters(subdomain, pageGuesses, warnings) {
     } catch (err) {
       continue; // no page by this exact title on the wiki — try the next guess
     }
-    if (!sections.length) continue;
-    const idx = findSectionIndex(sections, SEASON_CHARACTER_SECTION_NAMES);
-    if (idx == null) continue; // page exists but has nothing Cast/Characters-shaped — try the next guess
-    let links;
-    try {
-      links = await fetchSectionLinks(subdomain, pageTitle, idx);
-    } catch (err) {
-      warnings.push(`Found season page "${pageTitle}" with a Cast/Characters section, but couldn't read its links: ${err.message}`);
-      continue;
+
+    // Tier 1 (precise): a Cast/Characters-shaped section, if this page has
+    // one. Preferred whenever it's there, since it's scoped by the page's
+    // own structure rather than by our noise filter.
+    if (sections.length) {
+      const idx = findSectionIndex(sections, SEASON_CHARACTER_SECTION_NAMES);
+      if (idx != null) {
+        try {
+          const links = await fetchSectionLinks(subdomain, pageTitle, idx);
+          const titles = [...new Set(links)].filter((t) => !looksLikeNonCharacterTitle(t, pageTitle));
+          if (titles.length) return { pageTitle, titles, tier: 'section' };
+        } catch (err) {
+          warnings.push(`Found season page "${pageTitle}" with a Cast/Characters section, but couldn't read its links: ${err.message}`);
+        }
+      }
     }
-    const titles = [...new Set(links)].filter((t) => !looksLikeNonCharacterTitle(t, pageTitle));
-    if (titles.length) return { pageTitle, titles };
+
+    // Tier 2 (broad fallback): the page exists but tier 1 found nothing —
+    // either no Cast/Characters-shaped heading at all (cast might be in the
+    // infobox, or under a heading not in SEASON_CHARACTER_SECTION_NAMES), or
+    // that section existed but its links didn't survive the noise filter.
+    // Rather than give up on a page we know exists, grab every internal link
+    // on it and filter out the obvious non-cast noise (see the widened
+    // looksLikeNonCharacterTitle). This is what actually satisfies "grab the
+    // characters from the links on the page" for wikis that don't structure
+    // their season page the way tier 1 expects — it's noisier, but still a
+    // real read of THIS season's page, not the wiki-wide fallback below.
+    try {
+      const allLinks = await fetchAllPageLinks(subdomain, pageTitle);
+      const titles = [...new Set(allLinks)].filter((t) => !looksLikeNonCharacterTitle(t, pageTitle));
+      if (titles.length) {
+        warnings.push(`Season page "${pageTitle}" had no usable Cast/Characters section — used every link on the page instead (filtered for obvious non-character titles), so double-check the result for stragglers.`);
+        return { pageTitle, titles, tier: 'whole-page' };
+      }
+    } catch (err) {
+      warnings.push(`Found season page "${pageTitle}" but couldn't read its links: ${err.message}`);
+    }
+    // Neither tier produced anything usable for this page guess — try the
+    // next guess (e.g. bare "Season 5" after "<Fandom> Season 5" came up
+    // empty), and only fall through to wiki-wide category guessing once
+    // every guess has been exhausted (see the handler).
   }
-  return { pageTitle: null, titles: [] };
+  return { pageTitle: null, titles: [], tier: null };
 }
 
 async function fetchIntroExtract(subdomain, title) {
@@ -603,12 +765,110 @@ async function fetchIntroExtract(subdomain, title) {
   return page && page.extract ? cleanExtract(page.extract) : '';
 }
 
-async function fetchFullPageWikitext(subdomain, title) {
+// Raw (uncleaned) wikitext fetch. Used by fetchFullPageWikitext below (which
+// cleans it for plot/bio text) and by resolveArcTitleFromIndex (which needs
+// the raw [[Target|Display]] markup intact — cleanWikitext's link-flattening
+// pass throws away the Target half, keeping only the human-readable Display
+// half, which is exactly the half resolveArcTitleFromIndex can't use; see
+// parseArcIndexWikitext's own comment).
+async function fetchRawWikitext(subdomain, title) {
   const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=wikitext&redirects=1&format=json`;
   const data = await apiRequest(url);
   const field = data && data.parse && data.parse.wikitext;
-  const wikitext = typeof field === 'string' ? field : field && field['*'];
+  return (typeof field === 'string' ? field : field && field['*']) || '';
+}
+
+async function fetchFullPageWikitext(subdomain, title) {
+  const wikitext = await fetchRawWikitext(subdomain, title);
   return wikitext ? cleanWikitext(wikitext) : '';
+}
+
+// Resolves a bare "<Label> N" arc (e.g. "Arc 2") against a wiki-wide index
+// page (see buildArcIndexPageGuesses/parseArcIndexWikitext above) to
+// whatever that wiki actually calls entry N — e.g. "Breakaway" on Lookism's
+// "Arc Guide". Returns { resolvedTitle, indexPage } on a hit, or null if no
+// index page was found (or `arc` isn't a numbered "<Label> N" to begin
+// with — nothing to resolve). Called ONCE per request, before any of the
+// episode/character/season-page guess-building below, so a successful
+// resolution here is what lets THOSE go looking for "Breakaway" instead of
+// the literal, wiki-doesn't-actually-use-that "Arc 2".
+//
+// CACHING: the final resolution (hit OR miss) is cached under one synthetic
+// lore_categories row per (wiki, label, number) — piggybacking on the
+// existing category-members cache table (its `members` column is a plain
+// jsonb array, so `[resolvedTitle, indexPage]` fits it fine) rather than
+// adding a new table. This matters specifically because most wikis have NO
+// arc index page at all: without caching, a multi-batch arc load would
+// re-attempt every page guess in buildArcIndexPageGuesses (each a real,
+// uncached Fandom 404) on EVERY batch call for the same arc, up to
+// MAX_LORE_BATCHES times client-side — exactly the repeated-Fandom-call cost
+// the lore_categories cache exists to avoid elsewhere in this file. Category
+// name is prefixed distinctly ("Arc Index Resolution: ...") so it's obvious
+// in the table that it isn't a real Fandom category.
+//
+// Failures here (Supabase cache read/write, or a Fandom fetch that errors
+// for a reason OTHER than "no such page") are swallowed rather than thrown —
+// same resilience pattern as findFirstNonEmptyCategory below: worst case,
+// resolution just doesn't happen this round and guess-building falls back to
+// the literal "<Label> N" text, exactly as it did before this feature
+// existed. This is one arc-scoping guess among several, not something worth
+// failing the whole request over.
+async function resolveArcTitleFromIndex(subdomain, wikiId, fandom, year, arc, freshnessMs, warnings) {
+  const num = extractArcNumber(arc);
+  const label = arc ? String(arc).trim().split(/\s+/)[0] : null;
+  if (num == null || !label) return null;
+
+  const resolutionCacheKey = `Arc Index Resolution: ${label} ${num}`;
+  try {
+    const cached = await getCachedCategoryMembers(wikiId, resolutionCacheKey, freshnessMs);
+    if (cached !== null) {
+      if (!cached.length) return null; // cached "nothing resolved" — no index page, or entry out of range
+      const [resolvedTitle, indexPage] = cached;
+      warnings.push(`Resolved "${arc}" to "${resolvedTitle}" via the arc index page "${indexPage}" (entry #${num}) [cached].`);
+      return { resolvedTitle, indexPage };
+    }
+  } catch (err) {
+    warnings.push(`Arc index resolution cache lookup failed, trying Fandom directly: ${err.message}`);
+  }
+
+  const pageGuesses = buildArcIndexPageGuesses(fandom, year, label);
+  for (const pageTitle of pageGuesses) {
+    let wikitext;
+    try {
+      wikitext = await fetchRawWikitext(subdomain, pageTitle);
+    } catch (err) {
+      continue; // no page by this exact title on the wiki — try the next guess
+    }
+    const entries = parseArcIndexWikitext(wikitext);
+    if (!entries.length) continue; // page exists but has no numbered list on it — try the next guess
+
+    const resolvedTitle = entries[num - 1];
+    if (!resolvedTitle) {
+      warnings.push(`Found arc index page "${pageTitle}", but it only lists ${entries.length} entries — "${arc}" (entry #${num}) is out of range.`);
+      try {
+        await cacheCategoryMembers(wikiId, resolutionCacheKey, []);
+      } catch (err) {
+        // not fatal — worst case this same out-of-range guess repeats next call
+      }
+      return null;
+    }
+    warnings.push(
+      `Resolved "${arc}" to "${resolvedTitle}" via the arc index page "${pageTitle}" (entry #${num}) — using "${resolvedTitle}" for episode/character/season-page scoping below instead of the literal "${arc}".`
+    );
+    try {
+      await cacheCategoryMembers(wikiId, resolutionCacheKey, [resolvedTitle, pageTitle]);
+    } catch (err) {
+      // not fatal — worst case this same lookup repeats next call
+    }
+    return { resolvedTitle, indexPage: pageTitle };
+  }
+
+  try {
+    await cacheCategoryMembers(wikiId, resolutionCacheKey, []); // no index page found under any guess — cache the miss too
+  } catch (err) {
+    // not fatal
+  }
+  return null;
 }
 
 async function fetchEpisodePlot(subdomain, title, warnings) {
@@ -780,7 +1040,37 @@ export default async function handler(req, res) {
     }
     const wiki = { subdomain: wikiRow.subdomain, sitename: wikiRow.sitename, url: wikiRow.base_url };
 
-    const episodeCategoryGuesses = buildEpisodeCategoryGuesses(fandom, media, year, arc);
+    // ARC INDEX RESOLUTION: some wikis title their arcs/seasons/volumes with
+    // real names instead of numbers (Lookism's "Breakaway" rather than
+    // "Arc 2" — see resolveArcTitleFromIndex's own comment for the full
+    // explanation and https://lookism.fandom.com/wiki/Arc_Guide for the
+    // motivating example). For those wikis, every "<Label> N"-shaped guess
+    // below (episode category, character category, season page) is built
+    // from the literal `arc` text and can never match anything — which is
+    // exactly what silently degrades those guesses into their wiki-wide,
+    // unscoped fallback (e.g. episodeCategoryResult landing on a generic
+    // "Chapters" category containing the WHOLE series instead of just this
+    // arc). Resolving `arc` against the wiki's own index page FIRST, when
+    // one exists, and using the resolved title for guess-building instead
+    // fixes that at the source.
+    //
+    // `resolvedArc` is what every guess-builder below uses. The original
+    // `arc` is deliberately still used for: filterTitlesUpToArc (the
+    // NUMBER-based episode fallback, which needs an actual digit —
+    // "Breakaway" has none), and everything echoed back to the caller (the
+    // response's own `arc` field, `arcResolvedTitle` for debugging) so a
+    // client can always see both what was asked for and what it resolved to.
+    let resolvedArc = arc || null;
+    let arcIndexPage = null;
+    if (arc) {
+      const arcResolution = await resolveArcTitleFromIndex(wiki.subdomain, wikiRow.id, fandom, year, arc, freshnessMs, warnings);
+      if (arcResolution) {
+        resolvedArc = arcResolution.resolvedTitle;
+        arcIndexPage = arcResolution.indexPage;
+      }
+    }
+
+    const episodeCategoryGuesses = buildEpisodeCategoryGuesses(fandom, media, year, resolvedArc);
     const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, episodeCategoryGuesses, 500, freshnessMs);
     let episodeTitles = [];
     let episodeCategoryArcScoped = false;
@@ -790,7 +1080,9 @@ export default async function handler(req, res) {
       if (arc && !episodeCategoryResult.found.arcScoped) {
         const beforeCount = episodeTitles.length;
         episodeTitles = filterTitlesUpToArc(episodeTitles, arc);
-        warnings.push(`No category specific to "${arc}" — filtered by number instead (best-effort).`);
+        warnings.push(
+          `No category specific to "${resolvedArc}"${resolvedArc !== arc ? ` (resolved from "${arc}")` : ''} — filtered "${arc}" by number instead (best-effort).`
+        );
         // If the number-filter didn't actually remove anything, it's very
         // likely because none of the titles in this wiki-wide category
         // encode a season/arc number at all (most TV episode titles don't)
@@ -842,21 +1134,23 @@ export default async function handler(req, res) {
     let characterSource = 'none';
 
     if (arc) {
-      const seasonPageGuesses = buildSeasonPageGuesses(fandom, year, arc);
+      const seasonPageGuesses = buildSeasonPageGuesses(fandom, year, resolvedArc);
       const seasonResult = await findSeasonPageCharacters(wiki.subdomain, seasonPageGuesses, warnings);
       if (seasonResult.titles.length) {
         characterTitles = seasonResult.titles;
         characterCategoryArcScoped = true;
-        characterCategoryLabel = `Season page: "${seasonResult.pageTitle}"`;
-        characterSource = 'season-page';
+        characterCategoryLabel = `Season page: "${seasonResult.pageTitle}"${seasonResult.tier === 'whole-page' ? ' (whole-page links)' : ' (Cast/Characters section)'}`;
+        characterSource = seasonResult.tier === 'whole-page' ? 'season-page-whole' : 'season-page-section';
       } else {
-        warnings.push(`No season page with a Cast/Characters section was found for "${arc}" (tried: ${seasonPageGuesses.join(', ') || '(no guesses — no arc)'}) — falling back to character-category discovery.`);
+        warnings.push(
+          `No usable season page was found for "${resolvedArc}"${resolvedArc !== arc ? ` (resolved from "${arc}")` : ''} (tried: ${seasonPageGuesses.join(', ') || '(no guesses — no arc)'}) — falling back to character-category discovery.`
+        );
       }
     }
 
     let characterCategoryResult = { found: null, attempts: [] };
     if (!characterTitles.length) {
-      const characterCategoryGuesses = buildCharacterCategoryGuesses(fandom, year, arc);
+      const characterCategoryGuesses = buildCharacterCategoryGuesses(fandom, year, resolvedArc);
       characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, characterCategoryGuesses, 500, freshnessMs);
       // Copy (don't reference) `.members` — that array may be the same
       // object returned from the category cache, and this function is
@@ -924,6 +1218,8 @@ export default async function handler(req, res) {
         dryRun: true,
         wiki,
         arc: arc || null,
+        arcResolvedTitle: resolvedArc !== arc ? resolvedArc : null,
+        arcIndexPage,
         wikiId: wikiRow.id,
         episodesRequested: episodeTitles.length,
         episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
@@ -954,7 +1250,7 @@ export default async function handler(req, res) {
         try {
           if (item.type === 'episode') {
             const plot = await fetchEpisodePlot(wiki.subdomain, item.title, warnings);
-            await upsertEpisode(wikiRow.id, item.title, arc || null, plot);
+            await upsertEpisode(wikiRow.id, item.title, resolvedArc, plot);
           } else {
             const bullets = await fetchCharacterBullets(wiki.subdomain, item.title, warnings);
             await upsertCharacter(wikiRow.id, item.title, bullets);
@@ -967,7 +1263,7 @@ export default async function handler(req, res) {
           // infinite loop.
           try {
             if (item.type === 'episode') {
-              await upsertEpisode(wikiRow.id, item.title, arc || null, '');
+              await upsertEpisode(wikiRow.id, item.title, resolvedArc, '');
             } else {
               await upsertCharacter(wikiRow.id, item.title, {});
             }
@@ -989,6 +1285,9 @@ export default async function handler(req, res) {
         // the problem. Repeating this list is what lets the stall detector
         // name the culprit instead of just reporting "warnings: none".
         attempted: batch.map((item) => item.title),
+        arc: arc || null,
+        arcResolvedTitle: resolvedArc !== arc ? resolvedArc : null,
+        arcIndexPage,
         episodesRequested: episodeTitles.length,
         episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
         episodeCategoryArcScoped,
@@ -1049,6 +1348,8 @@ export default async function handler(req, res) {
       done: true,
       wiki,
       arc: arc || null,
+      arcResolvedTitle: resolvedArc !== arc ? resolvedArc : null,
+      arcIndexPage,
       episodes,
       characters,
       // Lets the client tell "this arc genuinely has this many episodes and
