@@ -1187,20 +1187,49 @@ async function upsertEpisode(wikiId, title, arc, plot) {
   if (error) throw new Error(`Supabase episode upsert failed: ${error.message}`);
 }
 
+// Character upserts MERGE with whatever's already cached, field by field,
+// instead of overwriting the whole row every time. Previously, a fetch that
+// came back empty for a given field — because a heading got removed/renamed
+// on the wiki, a subpage briefly failed to load, or the fetch attempt threw
+// and fell into the handler's "cache an empty placeholder" catch block —
+// would blank that field out immediately, permanently, with the old good
+// content gone the moment the new (empty) upsert landed. That's exactly what
+// a force-refresh after editing wiki headings would do, with no way back.
+// Now: a field only gets replaced when the fresh fetch actually found
+// content for it; an empty fetch result just leaves the existing cached
+// value alone. Costs one extra read per character per upsert — negligible
+// next to the Fandom fetch + REQUEST_DELAY_MS delay already happening around
+// each one. Loops over CHARACTER_SECTION_GROUPS's keys rather than a
+// hardcoded field list, same reasoning as characterHasContent above.
+//
+// Trade-off worth knowing: this means a force-refresh can no longer be used
+// to deliberately CLEAR a field just by removing its heading from the wiki —
+// the old value will keep winning forever until something writes over it. If
+// that's ever actually wanted, clear the field directly in Supabase (e.g.
+// `update lore_characters set powers = '[]'::jsonb where ...`) rather than
+// relying on a re-fetch to do it.
 async function upsertCharacter(wikiId, title, bullets) {
-  const { error } = await supabase.from('lore_characters').upsert(
-    {
-      wiki_id: wikiId,
-      title,
-      personality: bullets.personality || [],
-      history: bullets.history || [],
-      powers: bullets.powers || [],
-      relationships: bullets.relationships || [],
-      trivia: bullets.trivia || [],
-      fetched_at: new Date().toISOString(),
-    },
-    { onConflict: 'wiki_id,title' }
-  );
+  const { data: existing, error: lookupError } = await supabase
+    .from('lore_characters')
+    .select('*')
+    .eq('wiki_id', wikiId)
+    .eq('title', title)
+    .maybeSingle();
+  if (lookupError) throw new Error(`Supabase character lookup (pre-upsert) failed: ${lookupError.message}`);
+
+  const merged = { wiki_id: wikiId, title, fetched_at: new Date().toISOString() };
+  for (const key of Object.keys(CHARACTER_SECTION_GROUPS)) {
+    const fresh = bullets[key];
+    if (fresh && fresh.length) {
+      merged[key] = fresh; // this fetch found content — it wins
+    } else if (existing && existing[key] && existing[key].length) {
+      merged[key] = existing[key]; // fetch came back empty — keep what was already cached
+    } else {
+      merged[key] = []; // neither had anything — genuinely empty
+    }
+  }
+
+  const { error } = await supabase.from('lore_characters').upsert(merged, { onConflict: 'wiki_id,title' });
   if (error) throw new Error(`Supabase character upsert failed: ${error.message}`);
 }
 
