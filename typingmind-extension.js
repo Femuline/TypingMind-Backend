@@ -240,7 +240,7 @@
   const MEDIA_TYPES = ['show', 'movie', 'game', 'comic', 'webtoon'];
 
   const PROMPT_PATTERN = new RegExp(
-    `portray canon characters in\\s+(?:(season|arc|chapter|book|part)\\s+(\\d+)\\s+of\\s+)?(?:the\\s+)?(?:(\\d{4})\\s+)?(${MEDIA_TYPES.join('|')})\\s+(.+?)\\.`,
+    `portray canon characters in\\s+(?:(season|arc|chapter|book|part|volume)\\s+(\\d+)\\s+of\\s+)?(?:the\\s+)?(?:(\\d{4})\\s+)?(${MEDIA_TYPES.join('|')})\\s+(.+?)\\.`,
     'i'
   );
 
