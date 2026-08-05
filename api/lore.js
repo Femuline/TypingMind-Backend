@@ -29,35 +29,53 @@
  *
  * Every response (done:true OR done:false) now also includes
  * episodesRequested/episodeCategory/episodeCategoryArcScoped AND
- * charactersRequested/characterCategory/characterCategoryArcScoped — for
- * each: how many titles were actually resolved (0 is a valid but meaningful
- * number: it means no matching category was ever found/matched, NOT that
- * the arc has no episodes/characters), which Fandom category won, and
- * whether that category was scoped to the requested `arc` or is a
+ * charactersRequested/characterCategory/characterCategoryArcScoped/
+ * characterSource — for each: how many titles were actually resolved (0 is
+ * a valid but meaningful number: it means no matching source was ever
+ * found/matched, NOT that the arc has no episodes/characters), which
+ * Fandom category (or, for characters, season page — see characterSource)
+ * won, and whether that source was scoped to the requested `arc` or is a
  * wiki-wide fallback covering every season. done:true no longer means
  * "found everything" by itself — it only means "nothing is left in
  * `missing`," which is trivially true if episodesRequested/
  * charactersRequested came back 0. Check the *Requested fields to tell
  * those apart.
  *
- * ARC SCOPING — when `arc` is passed, BOTH episode and character category
- * guessing try arc-scoped category names first (e.g. "Charmed Season 1
- * Characters", "Season 1 Characters") before ever falling back to a
- * wiki-wide "Episodes"/"Characters" catch-all — see
- * buildEpisodeCategoryGuesses/buildCharacterCategoryGuesses. If an
- * arc-scoped category is found, its members are used as-is: that's a real,
- * exact scope to the requested season/arc, not a heuristic. If NO
- * arc-scoped category exists on the wiki, episodes fall back to a
- * best-effort NUMBER filter on the wiki-wide list (see
- * filterTitlesUpToArc) — but characters do NOT get an equivalent filter,
- * because character-page titles essentially never encode a season number
- * the way some episode titles do, so a title-based filter there would
- * almost always be a silent no-op masquerading as scoping. In that
- * fallback case the response's characterCategoryArcScoped is false and a
- * warning explicitly says the character list is the whole-series cast, not
- * scoped to `arc` — check warnings/characterCategoryArcScoped rather than
- * assuming a returned character list is automatically limited to the arc
- * you asked for.
+ * ARC SCOPING — EPISODES: when `arc` is passed, episode category guessing
+ * tries arc-scoped category names first (e.g. "Charmed Season 1 Episodes",
+ * "Season 1 Episodes") before ever falling back to a wiki-wide "Episodes"
+ * catch-all — see buildEpisodeCategoryGuesses. If an arc-scoped category is
+ * found, its members are used as-is: that's a real, exact scope to the
+ * requested season/arc, not a heuristic. If NO arc-scoped category exists,
+ * episodes fall back to a best-effort NUMBER filter on the wiki-wide list
+ * (see filterTitlesUpToArc).
+ *
+ * ARC SCOPING — CHARACTERS: characters are scoped differently, in two
+ * stages (see findSeasonPageCharacters / buildCharacterCategoryGuesses,
+ * called in that order from the handler):
+ *   1. SEASON PAGE (primary): fetch the season's own Fandom page (e.g.
+ *      "Season 6" — see buildSeasonPageGuesses) and read the character
+ *      links out of its Cast/Characters section. This is tried first
+ *      because real single-show wikis commonly give a season a proper cast
+ *      listing on its own page without ALSO filing those same characters
+ *      under a matching per-season CATEGORY — which is exactly what made
+ *      stage 2 below so often land on the wiki's entire cast instead of
+ *      just this arc's.
+ *   2. CATEGORY guessing (fallback, only if stage 1 found nothing): tries
+ *      arc-scoped category names first (e.g. "Charmed Season 1 Characters",
+ *      "Season 1 Characters") before ever falling back to a wiki-wide
+ *      "Characters" catch-all. Characters do NOT get a NUMBER-filter
+ *      fallback the way episodes do (see filterTitlesUpToArc), because
+ *      character-page titles essentially never encode a season number the
+ *      way some episode titles do — a title-based filter there would almost
+ *      always be a silent no-op masquerading as scoping.
+ * If NEITHER stage finds an arc-scoped source, the response's
+ * characterCategoryArcScoped is false and a warning explicitly says the
+ * character list is the whole-series cast, not scoped to `arc` — check
+ * warnings/characterCategoryArcScoped rather than assuming a returned
+ * character list is automatically limited to the arc you asked for.
+ * characterSource ('season-page' | 'category' | 'none') says which stage
+ * actually produced the list, for debugging.
  *
  * Resolves the Fandom wiki for `fandom`, figures out which episode/character
  * pages belong to `arc` (e.g. "Season 6"), and makes sure each one is cached
@@ -176,6 +194,15 @@ const CHARACTER_SECTION_GROUPS = {
   relationships: ['Relationships'],
   trivia: ['Trivia', 'Notes and Trivia', 'Notes'],
 };
+// Section names tried (in order — see findSectionIndex) on a SEASON page
+// itself (not a character page) to find its cast listing. "Cast and
+// Characters" is first because it's the actual heading Fandom's own TV-show
+// wikis commonly use (confirmed on Charmed's "Season 6" page); the rest are
+// looser fallbacks for wikis that phrase it differently. findSectionIndex's
+// startsWith pass means a bare "Cast" or "Characters" candidate will also
+// match a longer heading like "Cast and Characters" or "Characters and Cast"
+// on its own, so this list doesn't need to be exhaustive.
+const SEASON_CHARACTER_SECTION_NAMES = ['Cast and Characters', 'Characters', 'Cast', 'Main Cast', 'Starring Cast', 'Series Regulars'];
 
 const ALLOWED_ORIGINS = ['https://www.typingmind.com'];
 
@@ -374,6 +401,10 @@ function buildEpisodeCategoryGuesses(fandom, media, year, arc) {
 // resolving before a real "Season 1 Characters" one would otherwise win by
 // accident and silently hand back the whole-series cast for an arc-specific
 // request.
+// NOTE: this is now the FALLBACK for character discovery, used only when
+// findSeasonPageCharacters (which reads the season's own page instead of
+// guessing at a category) finds nothing — see the handler and the ARC
+// SCOPING — CHARACTERS note in the file header.
 // One-way difference from episodes: there's no equivalent of
 // filterTitlesUpToArc as a fallback here. Episode titles occasionally encode
 // a season/part number ("Season 5, Episode 3"); character-page titles
@@ -395,6 +426,25 @@ function buildCharacterCategoryGuesses(fandom, year, arc) {
   addQualified(genericGuesses, fandom, false);
   genericGuesses.push({ name: 'Main Characters', arcScoped: false }, { name: 'Characters', arcScoped: false }, { name: 'Character', arcScoped: false });
   return [...arcScopedGuesses, ...genericGuesses];
+}
+
+// Candidate Fandom PAGE titles (not category names) for the season/arc
+// itself, tried in order by findSeasonPageCharacters. On a real single-show
+// wiki the season page is usually just the bare arc name — e.g. Charmed's
+// wiki titles it plain "Season 6" (https://charmed.fandom.com/wiki/Season_6),
+// NOT "Charmed (season 6)" (that's Wikipedia's convention, not Fandom's) and
+// NOT "Charmed Season 6" either. The fandom/year-qualified guesses exist for
+// multi-show wikis where a bare "Season 1" could belong to more than one
+// series hosted on the same wiki (see the DISAMBIGUATING SHOW VERSIONS note
+// in the file header) — those are tried first so a qualified page wins over
+// an ambiguous bare one when both exist.
+function buildSeasonPageGuesses(fandom, year, arc) {
+  if (!arc) return [];
+  const guesses = [];
+  if (year) guesses.push(`${fandom} (${year}) ${arc}`);
+  guesses.push(`${fandom} ${arc}`);
+  guesses.push(arc);
+  return [...new Set(guesses.filter(Boolean))];
 }
 
 function extractArcNumber(arc) {
@@ -473,6 +523,76 @@ async function fetchSectionWikitext(subdomain, title, sectionIndex) {
   const field = data && data.parse && data.parse.wikitext;
   const wikitext = typeof field === 'string' ? field : field && field['*'];
   return wikitext ? cleanWikitext(wikitext) : '';
+}
+
+// Like fetchSectionWikitext, but returns the internal (same-wiki) page links
+// found within one section instead of that section's raw text. Used to read
+// a season page's Cast/Characters section as a list of character-page
+// titles, without us having to hand-roll a [[...]] regex over wikitext
+// (which would also have to duplicate cleanWikitext's template/ref
+// stripping to avoid false hits inside {{...}} navboxes).
+async function fetchSectionLinks(subdomain, title, sectionIndex) {
+  const url = `https://${subdomain}.fandom.com/api.php?action=parse&page=${encodeURIComponent(title)}&prop=links&section=${sectionIndex}&redirects=1&format=json`;
+  const data = await apiRequest(url);
+  const links = (data && data.parse && data.parse.links) || [];
+  return links
+    .filter((l) => l.ns === 0) // main namespace only — drops Category:/File:/Template:/User: links etc.
+    .map((l) => (typeof l['*'] === 'string' ? l['*'] : l.title)) // handles both formatversion=1 ('*') and =2 (title) shapes, same pattern as fetchSectionWikitext/fetchFullPageWikitext above
+    .filter(Boolean);
+}
+
+// A season page's Cast/Characters section can carry a small number of
+// wikilinks that aren't character pages even though they sit right next to
+// ones that are — most commonly a self-link back to the season page itself
+// (from a "see also"-style note) or a "List of ..." index page. Filtered out
+// up front so they're never even attempted as character-page fetches, rather
+// than relying solely on fetchCharacterBullets's after-the-fact "found
+// nothing" warning (see the emptyBulletTitles filtering in the handler,
+// which is the backstop for anything that slips past this — e.g. an actor's
+// own bio page linked from the same section, which this name-shape check
+// can't catch).
+function looksLikeNonCharacterTitle(title, seasonPageTitle) {
+  if (title === seasonPageTitle) return true;
+  return /^(list of|category:|season\s*\d|episode\s*\d)/i.test(title);
+}
+
+// PRIMARY character-discovery strategy when an arc/season is requested: go
+// straight to the season's own Fandom page (see buildSeasonPageGuesses) and
+// read the character links out of its Cast/Characters section, instead of
+// guessing at a separate "<arc> Characters" CATEGORY page the way
+// buildCharacterCategoryGuesses does. Real single-show wikis commonly give a
+// season its own page with a proper cast listing but do NOT also file
+// characters under a matching per-season CATEGORY — that gap is exactly why
+// the category approach so often falls through to a wiki-wide, unscoped
+// "Characters" category (see buildCharacterCategoryGuesses's own comment).
+// Reading the season page's own cast listing sidesteps that gap: it's
+// exactly the character list a human reading that page would see, scoped to
+// that season by construction rather than by a category-name guess.
+// Category-based discovery (buildCharacterCategoryGuesses) is the FALLBACK
+// for this now, used only when every page guess here comes back empty — see
+// the handler.
+async function findSeasonPageCharacters(subdomain, pageGuesses, warnings) {
+  for (const pageTitle of pageGuesses) {
+    let sections;
+    try {
+      sections = await fetchPageSections(subdomain, pageTitle);
+    } catch (err) {
+      continue; // no page by this exact title on the wiki — try the next guess
+    }
+    if (!sections.length) continue;
+    const idx = findSectionIndex(sections, SEASON_CHARACTER_SECTION_NAMES);
+    if (idx == null) continue; // page exists but has nothing Cast/Characters-shaped — try the next guess
+    let links;
+    try {
+      links = await fetchSectionLinks(subdomain, pageTitle, idx);
+    } catch (err) {
+      warnings.push(`Found season page "${pageTitle}" with a Cast/Characters section, but couldn't read its links: ${err.message}`);
+      continue;
+    }
+    const titles = [...new Set(links)].filter((t) => !looksLikeNonCharacterTitle(t, pageTitle));
+    if (titles.length) return { pageTitle, titles };
+  }
+  return { pageTitle: null, titles: [] };
 }
 
 async function fetchIntroExtract(subdomain, title) {
@@ -705,24 +825,57 @@ export default async function handler(req, res) {
       }
     }
 
-    const characterCategoryGuesses = buildCharacterCategoryGuesses(fandom, year, arc);
-    const characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, characterCategoryGuesses, 500, freshnessMs);
+    // Character discovery: try the SEASON PAGE first (findSeasonPageCharacters
+    // — reads the Cast/Characters section of the season's own page, e.g.
+    // "Season 6"), and only fall back to CATEGORY guessing
+    // (buildCharacterCategoryGuesses — a separate "<arc> Characters"-style
+    // category page) if that comes back empty, because the category
+    // approach so often lands on an unscoped, wiki-wide "Characters"
+    // category instead (see that function's own comment for why). Both
+    // paths feed the same characterTitles/characterCategoryArcScoped/
+    // characterCategory response fields below, so a client reading the
+    // response can't tell which path won just from the shape of the
+    // response — characterSource says which one did, for debugging.
+    let characterTitles = [];
     let characterCategoryArcScoped = false;
-    // Copy (don't reference) `.members` — that array may be the same object
-    // returned from the category cache, and this function is about to push
-    // extra titles onto characterTitles below.
-    let characterTitles = characterCategoryResult.found ? [...characterCategoryResult.found.members] : [];
-    if (characterCategoryResult.found) {
-      characterCategoryArcScoped = characterCategoryResult.found.arcScoped;
-      if (arc && !characterCategoryArcScoped) {
-        warnings.push(
-          `No character category specific to "${arc}" was found — falling back to this wiki's whole-series cast ("${characterCategoryResult.found.name}"), NOT just "${arc}". Character-page titles essentially never encode a season/arc number the way some episode titles do, so there's no reliable way to filter this list down automatically the way episodes get filtered above. Treat the character corpus as unscoped; use extraCharacters to hand-pick titles if you only want specific ones from this arc.`
-        );
+    let characterCategoryLabel = null;
+    let characterSource = 'none';
+
+    if (arc) {
+      const seasonPageGuesses = buildSeasonPageGuesses(fandom, year, arc);
+      const seasonResult = await findSeasonPageCharacters(wiki.subdomain, seasonPageGuesses, warnings);
+      if (seasonResult.titles.length) {
+        characterTitles = seasonResult.titles;
+        characterCategoryArcScoped = true;
+        characterCategoryLabel = `Season page: "${seasonResult.pageTitle}"`;
+        characterSource = 'season-page';
+      } else {
+        warnings.push(`No season page with a Cast/Characters section was found for "${arc}" (tried: ${seasonPageGuesses.join(', ') || '(no guesses — no arc)'}) — falling back to character-category discovery.`);
       }
-    } else if (characterCategoryResult.attempts.length) {
-      warnings.push(`Couldn't check character categories: ${characterCategoryResult.attempts.join(' | ')}`);
-    } else {
-      warnings.push('No character category found on this wiki.');
+    }
+
+    let characterCategoryResult = { found: null, attempts: [] };
+    if (!characterTitles.length) {
+      const characterCategoryGuesses = buildCharacterCategoryGuesses(fandom, year, arc);
+      characterCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, characterCategoryGuesses, 500, freshnessMs);
+      // Copy (don't reference) `.members` — that array may be the same
+      // object returned from the category cache, and this function is
+      // about to push extra titles onto characterTitles below.
+      characterTitles = characterCategoryResult.found ? [...characterCategoryResult.found.members] : [];
+      if (characterCategoryResult.found) {
+        characterCategoryArcScoped = characterCategoryResult.found.arcScoped;
+        characterCategoryLabel = characterCategoryResult.found.name;
+        characterSource = 'category';
+        if (arc && !characterCategoryArcScoped) {
+          warnings.push(
+            `No character category specific to "${arc}" was found either — falling back to this wiki's whole-series cast ("${characterCategoryResult.found.name}"), NOT just "${arc}". Character-page titles essentially never encode a season/arc number the way some episode titles do, so there's no reliable way to filter this list down automatically the way episodes get filtered above. Treat the character corpus as unscoped; use extraCharacters to hand-pick titles if you only want specific ones from this arc.`
+          );
+        }
+      } else if (characterCategoryResult.attempts.length) {
+        warnings.push(`Couldn't check character categories: ${characterCategoryResult.attempts.join(' | ')}`);
+      } else {
+        warnings.push('No character category found on this wiki.');
+      }
     }
 
     const extraCharacterTitles = normalizeExtraTitles(extraCharacters);
@@ -778,8 +931,9 @@ export default async function handler(req, res) {
         episodeStatus,
         missingEpisodes: episodeStatus.filter((e) => e.status !== 'ok').map((e) => e.title),
         charactersRequested: characterTitles.length,
-        characterCategory: characterCategoryResult.found ? characterCategoryResult.found.name : null,
+        characterCategory: characterCategoryLabel,
         characterCategoryArcScoped,
+        characterSource,
         characterStatus,
         missingCharacters: characterStatus.filter((c) => c.status !== 'ok').map((c) => c.title),
         warnings,
@@ -839,8 +993,9 @@ export default async function handler(req, res) {
         episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
         episodeCategoryArcScoped,
         charactersRequested: characterTitles.length,
-        characterCategory: characterCategoryResult.found ? characterCategoryResult.found.name : null,
+        characterCategory: characterCategoryLabel,
         characterCategoryArcScoped,
+        characterSource,
         warnings,
       });
     }
@@ -860,16 +1015,35 @@ export default async function handler(req, res) {
     if (emptyPlotTitles.length) {
       warnings.push(`${emptyPlotTitles.length} episode(s) are cached but have no usable plot text, so they're excluded from the corpus: ${emptyPlotTitles.join(', ')}`);
     }
-    const characters = characterTitles.map((title) => {
+    // Same "cached but unusable" filtering as emptyPlotTitles above, plus a
+    // second job: a title picked up from a season page's Cast/Characters
+    // section that turns out NOT to be an actual character page (an actor's
+    // own bio page linked from that section, say — see the comment on
+    // looksLikeNonCharacterTitle for why that check can't catch this case up
+    // front) will fetch successfully but come back with none of History/
+    // Powers/Relationships/Trivia, exactly like a genuinely-failed fetch
+    // does. Dropping it here means a stray non-character link never
+    // silently rides along in the corpus as a nameplate with no content.
+    const emptyBulletTitles = [];
+    const characters = [];
+    for (const title of characterTitles) {
       const row = cachedCharacters[title];
-      return {
-        name: title,
-        history: (row && row.history) || [],
-        powers: (row && row.powers) || [],
-        relationships: (row && row.relationships) || [],
-        trivia: (row && row.trivia) || [],
-      };
-    });
+      const hasContent = !!(row && (row.history?.length || row.powers?.length || row.relationships?.length || row.trivia?.length));
+      if (hasContent) {
+        characters.push({
+          name: title,
+          history: row.history || [],
+          powers: row.powers || [],
+          relationships: row.relationships || [],
+          trivia: row.trivia || [],
+        });
+      } else {
+        emptyBulletTitles.push(title);
+      }
+    }
+    if (emptyBulletTitles.length) {
+      warnings.push(`${emptyBulletTitles.length} character(s) are cached but have no usable bio content, so they're excluded from the corpus: ${emptyBulletTitles.join(', ')}`);
+    }
 
     return res.status(200).json({
       done: true,
@@ -885,8 +1059,9 @@ export default async function handler(req, res) {
       episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
       episodeCategoryArcScoped,
       charactersRequested: characterTitles.length,
-      characterCategory: characterCategoryResult.found ? characterCategoryResult.found.name : null,
+      characterCategory: characterCategoryLabel,
       characterCategoryArcScoped,
+      characterSource,
       warnings,
     });
   } catch (err) {
