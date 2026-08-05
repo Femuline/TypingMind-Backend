@@ -422,6 +422,7 @@
     }
     for (const ch of corpus.characters || []) {
       const parts = [];
+      if (ch.personality && ch.personality.length) parts.push(`**Personality**\n${ch.personality.map((b) => `- ${b}`).join('\n')}`);
       if (ch.history && ch.history.length) parts.push(`**History**\n${ch.history.map((b) => `- ${b}`).join('\n')}`);
       if (ch.powers && ch.powers.length) parts.push(`**Powers/Abilities**\n${ch.powers.map((b) => `- ${b}`).join('\n')}`);
       if (ch.relationships && ch.relationships.length) parts.push(`**Relationships**\n${ch.relationships.map((b) => `- ${b}`).join('\n')}`);
