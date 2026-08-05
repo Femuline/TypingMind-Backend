@@ -31,14 +31,14 @@
  * arcResolvedTitle/arcIndexPage (see ARC INDEX RESOLUTION below —
  * arcResolvedTitle/arcIndexPage are null unless a numbered `arc` actually
  * got resolved to a real title via the wiki's own index page) AND
- * episodesRequested/episodeCategory/episodeCategoryArcScoped AND
+ * episodesRequested/episodeCategory/episodeCategoryArcScoped/episodeSource AND
  * charactersRequested/characterCategory/characterCategoryArcScoped/
  * characterSource — for each: how many titles were actually resolved (0 is
  * a valid but meaningful number: it means no matching source was ever
- * found/matched, NOT that the arc has no episodes/characters), which
- * Fandom category (or, for characters, season page — see characterSource)
- * won, and whether that source was scoped to the requested `arc` or is a
- * wiki-wide fallback covering every season. done:true no longer means
+ * found/matched, NOT that the arc has no episodes/characters), which Fandom
+ * category (or, for episodes/characters, arc/season page — see episodeSource/
+ * characterSource) won, and whether that source was scoped to the requested
+ * `arc` or is a wiki-wide fallback covering every season. done:true no longer means
  * "found everything" by itself — it only means "nothing is left in
  * `missing`," which is trivially true if episodesRequested/
  * charactersRequested came back 0. Check the *Requested fields to tell
@@ -67,23 +67,44 @@
  *
  * ARC SCOPING — EPISODES: when `arc` is passed, episode category guessing
  * tries arc-scoped category names first (e.g. "Charmed Season 1 Episodes",
- * "Season 1 Episodes") before ever falling back to a wiki-wide "Episodes"
- * catch-all — see buildEpisodeCategoryGuesses. If an arc-scoped category is
- * found, its members are used as-is: that's a real, exact scope to the
- * requested season/arc, not a heuristic. If NO arc-scoped category exists,
- * episodes fall back to a best-effort NUMBER filter on the wiki-wide list
- * (see filterTitlesToArc).
+ * "Season 1 Episodes", and — FIX (2026-08) — the "/" subcategory form some
+ * wikis use instead, e.g. "Episodes/Season 1" on Stranger Things Wiki; see
+ * buildEpisodeCategoryGuesses) before ever falling back to a wiki-wide
+ * "Episodes" catch-all. If an arc-scoped category is found, its members are
+ * used as-is: that's a real, exact scope to the requested season/arc, not a
+ * heuristic (episodeSource: 'category').
+ * If NO arc-scoped category exists, this — FIX (2026-08) — now tries reading
+ * the episode list straight off the arc/season's own PAGE next
+ * (findArcPageEpisodes, using the same page guesses as
+ * findSeasonPageCharacters — see buildSeasonPageGuesses), the same way
+ * characters already did (see ARC SCOPING — CHARACTERS below). This is what
+ * fixes wikis like Lookism, which has no per-arc episode category at all —
+ * only a per-arc PAGE ("Breakaway", "Cheonliang Arc", ...) whose own
+ * Synopsis section links each of its own chapters (episodeSource:
+ * 'arc-page-section' / 'arc-page-whole'). ONLY if that also finds nothing do
+ * episodes fall back to a best-effort NUMBER filter on the wiki-wide
+ * category list (see filterTitlesToArc; episodeSource: 'category' with
+ * episodeCategoryArcScoped: false — check that combination, not just
+ * episodeCategory being non-null, to know whether the result is actually
+ * scoped). That NUMBER filter is a silent no-op on any wiki whose
+ * episode/chapter titles don't literally encode a season/arc number in the
+ * title itself (confirmed on Stranger Things, whose episode pages are titled
+ * things like "The Vanishing of Will Byers" — no number at all — and would
+ * have kept silently returning the whole series if buildEpisodeCategoryGuesses'
+ * "/" guess above hadn't fixed the category match directly instead).
  *
  * ARC SCOPING — CHARACTERS: characters are scoped differently, in two
  * stages (see findSeasonPageCharacters / buildCharacterCategoryGuesses,
  * called in that order from the handler). Stage 1 itself has two tiers:
  *   1. SEASON PAGE (primary): fetch the season's own Fandom page (e.g.
- *      "Season 6" — see buildSeasonPageGuesses) and read the character
- *      links off of it. This is tried first because real single-show wikis
- *      commonly give a season a proper cast listing on its own page without
- *      ALSO filing those same characters under a matching per-season
- *      CATEGORY — which is exactly what made stage 2 below so often land on
- *      the wiki's entire cast instead of just this arc's.
+ *      "Season 6", or — FIX (2026-08) — "<Fandom>/<Arc>" for wikis that
+ *      subpage it instead, e.g. "Stranger Things/Season 1"; see
+ *      buildSeasonPageGuesses) and read the character links off of it. This
+ *      is tried first because real single-show wikis commonly give a season
+ *      a proper cast listing on its own page without ALSO filing those same
+ *      characters under a matching per-season CATEGORY — which is exactly
+ *      what made stage 2 below so often land on the wiki's entire cast
+ *      instead of just this arc's.
  *        a. Section tier (precise): if the page has a Cast/Characters-shaped
  *           heading (see SEASON_CHARACTER_SECTION_NAMES), read the links out
  *           of just that section.
@@ -497,6 +518,21 @@ function buildEpisodeCategoryGuesses(fandom, media, year, arc) {
   if (arc && year) addQualified(arcScopedGuesses, `${fandom} (${year}) ${arc}`, true);
   if (arc) addQualified(arcScopedGuesses, `${fandom} ${arc}`, true);
   if (arc) {
+    // FIX (2026-08): some wikis subcategorize with a literal "/" instead of
+    // any word-order qualifier — e.g. Stranger Things Wiki files Season 1's
+    // episodes under "Category:Episodes/Season 1", not "Category:Stranger
+    // Things Season 1 Episodes" or "Category:Season 1 Episodes" (confirmed;
+    // that wiki does the identical "/" thing for Category:Characters/Season 1
+    // and its season pages too — see buildCharacterCategoryGuesses/
+    // buildSeasonPageGuesses). No word-order guess above or below this ever
+    // matched that shape, so a wiki like that fell straight through to the
+    // wiki-wide catch-all category further down, and filterTitlesToArc
+    // couldn't rescue it either (Stranger Things' own episode titles, e.g.
+    // "The Vanishing of Will Byers", don't encode a season number at all) —
+    // hence every season silently returning the whole series. Tried ahead of
+    // the looser `${arc} ${primary}`/bare-`${arc}` guesses below since it's a
+    // confirmed real convention, not a loose guess.
+    for (const word of withCasings(primary)) arcScopedGuesses.push({ name: `${word}/${arc}`, arcScoped: true });
     arcScopedGuesses.push({ name: `${arc} ${primary}`, arcScoped: true });
     arcScopedGuesses.push({ name: arc, arcScoped: true });
   }
@@ -532,6 +568,15 @@ function buildCharacterCategoryGuesses(fandom, year, arc) {
   };
   if (arc && year) addQualified(arcScopedGuesses, `${fandom} (${year}) ${arc}`, true);
   if (arc) addQualified(arcScopedGuesses, `${fandom} ${arc}`, true);
+  if (arc) {
+    // Same "/" subcategory convention as buildEpisodeCategoryGuesses (see its
+    // comment) — confirmed on Stranger Things Wiki as Category:Characters/
+    // Season 1. This is the fallback path here (findSeasonPageCharacters is
+    // tried first — see the handler), but kept in sync anyway so a wiki
+    // where the season PAGE approach also fails still has a chance via this
+    // category.
+    for (const word of withCasings('Characters')) arcScopedGuesses.push({ name: `${word}/${arc}`, arcScoped: true });
+  }
   if (arc) addQualified(arcScopedGuesses, arc, true);
   if (year) addQualified(genericGuesses, `${fandom} (${year})`, false);
   addQualified(genericGuesses, fandom, false);
@@ -554,6 +599,13 @@ function buildSeasonPageGuesses(fandom, year, arc) {
   const guesses = [];
   if (year) guesses.push(`${fandom} (${year}) ${arc}`);
   guesses.push(`${fandom} ${arc}`);
+  // Same "/" subpage convention noted in buildEpisodeCategoryGuesses —
+  // confirmed as the ACTUAL page title on Stranger Things Wiki:
+  // "Stranger Things/Season 1", not "Stranger Things Season 1" (which
+  // doesn't exist as a page there at all, so without this guess
+  // findSeasonPageCharacters/findArcPageEpisodes never found that wiki's
+  // season page and always fell through to a wiki-wide fallback).
+  guesses.push(`${fandom}/${arc}`);
   guesses.push(arc);
   return [...new Set(guesses.filter(Boolean))];
 }
@@ -836,6 +888,98 @@ async function findSeasonPageCharacters(subdomain, pageGuesses, warnings) {
     // next guess (e.g. bare "Season 5" after "<Fandom> Season 5" came up
     // empty), and only fall through to wiki-wide category guessing once
     // every guess has been exhausted (see the handler).
+  }
+  return { pageTitle: null, titles: [], tier: null };
+}
+
+// Section names tried on an ARC/SEASON's own page (same page guesses as
+// findSeasonPageCharacters — see buildSeasonPageGuesses) to find ITS OWN
+// episode/chapter list — the episode-side counterpart to
+// SEASON_CHARACTER_SECTION_NAMES. "Synopsis" first because it's the
+// confirmed heading on wikis that give a whole arc ONE page instead of ever
+// filing its episodes/chapters under a matching per-arc CATEGORY — Lookism is
+// the motivating example: e.g. https://lookism.fandom.com/wiki/Cheonliang_Arc
+// has a "3 Synopsis" section with one numbered sub-heading per chapter
+// ("3.1 Episode 482", "3.2 Episode 483", ...) followed by an "In
+// alphabetical order:" list linking each chapter's own page. On a wiki like
+// that, buildEpisodeCategoryGuesses can never find anything arc-scoped,
+// because no such category exists there AT ALL — only this per-arc page does.
+const SEASON_EPISODE_SECTION_NAMES = ['Synopsis', 'Episodes', 'Chapters', 'Episode List', 'Chapter List', 'Plot'];
+
+// Is `title` SHAPED like an episode/chapter page for this media type — e.g.
+// "Episode 482", "Chapter 12"? Used as an ALLOW-list by findArcPageEpisodes
+// below — the opposite bias from looksLikeNonCharacterTitle, which EXCLUDES
+// this exact shape (that function filters stray episode links OUT of a
+// character list; here we're reading an arc page specifically to find its
+// episode links, so everything else on the page — character names, location
+// names, the arc's own self-link — is the noise to drop instead). This only
+// works on wikis whose episode/chapter titles actually encode a number in
+// the page title itself (confirmed on Lookism: chapter pages are literally
+// titled "Episode 482"); it correctly finds nothing on a wiki like Charmed or
+// Stranger Things whose episode pages carry a proper name instead — that's
+// fine, since findArcPageEpisodes only ever runs as a fallback on top of
+// whatever buildEpisodeCategoryGuesses' category-based discovery already
+// found for those wikis (see the handler).
+function looksLikeEpisodeTitle(title, media) {
+  const synonyms = MEDIA_EPISODE_SYNONYMS[media] || MEDIA_EPISODE_SYNONYMS.show;
+  const words = [...new Set([...synonyms.map((s) => s.replace(/s$/i, '')), 'episode', 'chapter', 'issue', 'part', 'ep'])];
+  const pattern = new RegExp(`^(?:${words.join('|')})\\.?\\s*0*\\d+`, 'i');
+  return pattern.test(title);
+}
+
+// SECONDARY episode-discovery strategy, tried when episode-CATEGORY
+// discovery (buildEpisodeCategoryGuesses) found no ARC-SCOPED category —
+// mirrors findSeasonPageCharacters' role for characters, for the same
+// reason: a wiki can give an arc/season its own page with a real episode
+// listing on it without ALSO filing those same episodes under a matching
+// per-arc CATEGORY. Unlike characters, this is NOT the PRIMARY episode
+// strategy — most single-show wikis DO have a working per-season episode
+// category (see the file header's ARC SCOPING — EPISODES note), and
+// filterTitlesToArc's number filter is a reasonable best-effort on top of
+// that when they don't. This exists specifically for wikis where NEITHER a
+// category NOR a number-in-title filter can locate the arc's episodes —
+// Lookism is the motivating example: its chapter page numbers (e.g. 482-501
+// for the Cheonliang arc) are the chapter's absolute position in the WHOLE
+// series, with no relationship to the arc's own index number, so no
+// number-based filter could ever get this right even in principle.
+async function findArcPageEpisodes(subdomain, pageGuesses, media, warnings) {
+  for (const pageTitle of pageGuesses) {
+    let sections;
+    try {
+      sections = await fetchPageSections(subdomain, pageTitle);
+    } catch (err) {
+      continue; // no page by this exact title on the wiki — try the next guess
+    }
+
+    if (sections.length) {
+      const idx = findSectionIndex(sections, SEASON_EPISODE_SECTION_NAMES);
+      if (idx != null) {
+        try {
+          const links = await fetchSectionLinks(subdomain, pageTitle, idx);
+          const titles = [...new Set(links)].filter((t) => t !== pageTitle && looksLikeEpisodeTitle(t, media));
+          if (titles.length) return { pageTitle, titles, tier: 'section' };
+        } catch (err) {
+          warnings.push(`Found arc page "${pageTitle}" with a Synopsis/Episodes-shaped section, but couldn't read its links: ${err.message}`);
+        }
+      }
+    }
+
+    // Broad fallback: the page exists but no section above yielded any
+    // episode-shaped links — grab every internal link on the page and keep
+    // only the ones shaped like an episode/chapter title. In practice this
+    // rarely differs from the section tier, since looksLikeEpisodeTitle's
+    // allow-list means it can only ever pick up things that actually look
+    // like "Episode N"/"Chapter N" regardless of where on the page they sit.
+    try {
+      const allLinks = await fetchAllPageLinks(subdomain, pageTitle);
+      const titles = [...new Set(allLinks)].filter((t) => t !== pageTitle && looksLikeEpisodeTitle(t, media));
+      if (titles.length) {
+        warnings.push(`Arc page "${pageTitle}" had no usable Synopsis/Episodes section — used every episode-shaped link on the page instead.`);
+        return { pageTitle, titles, tier: 'whole-page' };
+      }
+    } catch (err) {
+      warnings.push(`Found arc page "${pageTitle}" but couldn't read its links: ${err.message}`);
+    }
   }
   return { pageTitle: null, titles: [], tier: null };
 }
@@ -1305,18 +1449,51 @@ export default async function handler(req, res) {
       }
     }
 
+    // Computed once, up front, since both episode and character discovery
+    // below can each independently need to read the arc/season's own page
+    // (findArcPageEpisodes / findSeasonPageCharacters) instead of guessing at
+    // a separate CATEGORY — see each function's own comment for why.
+    const seasonPageGuesses = buildSeasonPageGuesses(fandom, year, resolvedArc);
+
     const episodeCategoryGuesses = buildEpisodeCategoryGuesses(fandom, media, year, resolvedArc);
     const episodeCategoryResult = await findFirstNonEmptyCategory(wiki.subdomain, wikiRow.id, episodeCategoryGuesses, 500, freshnessMs);
     let episodeTitles = [];
     let episodeCategoryArcScoped = false;
-    if (episodeCategoryResult.found) {
-      episodeCategoryArcScoped = episodeCategoryResult.found.arcScoped;
+    let episodeCategoryLabel = null;
+    let episodeSource = 'none';
+    if (episodeCategoryResult.found && episodeCategoryResult.found.arcScoped) {
+      // A real arc-scoped CATEGORY exists — trust it as-is, no further
+      // scoping needed.
+      episodeCategoryArcScoped = true;
       episodeTitles = episodeCategoryResult.found.members;
-      if (arc && !episodeCategoryResult.found.arcScoped) {
-        const beforeCount = episodeTitles.length;
-        episodeTitles = filterTitlesToArc(episodeTitles, arc);
+      episodeCategoryLabel = episodeCategoryResult.found.name;
+      episodeSource = 'category';
+    } else if (arc) {
+      // No arc-scoped episode CATEGORY was found (either no category at all,
+      // or only a wiki-wide, unscoped one). Before falling back to a
+      // best-effort NUMBER filter on that wiki-wide list — which is a silent
+      // no-op on any wiki whose episode/chapter titles don't literally
+      // encode a season/arc number, see filterTitlesToArc's own comment —
+      // try reading the episode list directly off the arc's own page
+      // instead. Lookism is the motivating example: it has no per-arc
+      // episode category at all, but each arc's own page (e.g. "Breakaway",
+      // "Cheonliang Arc") lists exactly its own chapters. See
+      // findArcPageEpisodes' own comment for the full reasoning.
+      const arcPageResult = await findArcPageEpisodes(wiki.subdomain, seasonPageGuesses, media, warnings);
+      if (arcPageResult.titles.length) {
+        episodeTitles = arcPageResult.titles;
+        episodeCategoryArcScoped = true;
+        episodeCategoryLabel = `Arc page: "${arcPageResult.pageTitle}"${arcPageResult.tier === 'whole-page' ? ' (whole-page links)' : ' (Synopsis/Episodes section)'}`;
+        episodeSource = arcPageResult.tier === 'whole-page' ? 'arc-page-whole' : 'arc-page-section';
+      } else if (episodeCategoryResult.found) {
+        // Fall back to the wiki-wide category + best-effort number filter,
+        // same as before this fix.
+        episodeCategoryLabel = episodeCategoryResult.found.name;
+        episodeSource = 'category';
+        const beforeCount = episodeCategoryResult.found.members.length;
+        episodeTitles = filterTitlesToArc(episodeCategoryResult.found.members, arc);
         warnings.push(
-          `No category specific to "${resolvedArc}"${resolvedArc !== arc ? ` (resolved from "${arc}")` : ''} — filtered "${arc}" by number instead (best-effort).`
+          `No category or arc page specific to "${resolvedArc}"${resolvedArc !== arc ? ` (resolved from "${arc}")` : ''} — filtered "${arc}" by number instead (best-effort).`
         );
         // If the number-filter didn't actually remove anything, it's very
         // likely because none of the titles in this wiki-wide category
@@ -1328,6 +1505,10 @@ export default async function handler(req, res) {
             `"${arc}" filter matched every title in "${episodeCategoryResult.found.name}" (${beforeCount} of ${beforeCount}) — none of them appear to encode a season/arc number, so this is almost certainly the WHOLE-SERIES episode list, not just "${arc}". Treat the resulting corpus as unscoped.`
           );
         }
+      } else if (episodeCategoryResult.attempts.length) {
+        warnings.push(`Couldn't check episode/chapter categories: ${episodeCategoryResult.attempts.join(' | ')}`);
+      } else {
+        warnings.push('No episode/chapter category found on this wiki, and no usable arc page either.');
       }
     } else if (episodeCategoryResult.attempts.length) {
       warnings.push(`Couldn't check episode/chapter categories: ${episodeCategoryResult.attempts.join(' | ')}`);
@@ -1369,7 +1550,6 @@ export default async function handler(req, res) {
     let characterSource = 'none';
 
     if (arc) {
-      const seasonPageGuesses = buildSeasonPageGuesses(fandom, year, resolvedArc);
       const seasonResult = await findSeasonPageCharacters(wiki.subdomain, seasonPageGuesses, warnings);
       if (seasonResult.titles.length) {
         characterTitles = seasonResult.titles;
@@ -1490,8 +1670,9 @@ export default async function handler(req, res) {
         arcIndexPage,
         wikiId: wikiRow.id,
         episodesRequested: episodeTitles.length,
-        episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
+        episodeCategory: episodeCategoryLabel,
         episodeCategoryArcScoped,
+        episodeSource,
         episodeStatus,
         missingEpisodes: episodeStatus.filter((e) => e.status !== 'ok').map((e) => e.title),
         charactersRequested: characterTitles.length,
@@ -1557,8 +1738,9 @@ export default async function handler(req, res) {
         arcResolvedTitle: resolvedArc !== arc ? resolvedArc : null,
         arcIndexPage,
         episodesRequested: episodeTitles.length,
-        episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
+        episodeCategory: episodeCategoryLabel,
         episodeCategoryArcScoped,
+        episodeSource,
         charactersRequested: characterTitles.length,
         characterCategory: characterCategoryLabel,
         characterCategoryArcScoped,
@@ -1625,8 +1807,9 @@ export default async function handler(req, res) {
       // there was nothing to fetch and done:true was trivially true." Same
       // shape as the done:false progress fields above, on purpose.
       episodesRequested: episodeTitles.length,
-      episodeCategory: episodeCategoryResult.found ? episodeCategoryResult.found.name : null,
+      episodeCategory: episodeCategoryLabel,
       episodeCategoryArcScoped,
+      episodeSource,
       charactersRequested: characterTitles.length,
       characterCategory: characterCategoryLabel,
       characterCategoryArcScoped,
