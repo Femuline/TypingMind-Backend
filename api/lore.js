@@ -62,7 +62,7 @@
  * title is surfaced as `arcResolvedTitle` in every response shape (null
  * when nothing needed resolving); the index page it came from is
  * `arcIndexPage`. The literal `arc` text is still what's used for the
- * NUMBER-based episode fallback filter (filterTitlesUpToArc, which needs an
+ * NUMBER-based episode fallback filter (filterTitlesToArc, which needs an
  * actual digit) and for everything echoed back to the caller.
  *
  * ARC SCOPING — EPISODES: when `arc` is passed, episode category guessing
@@ -72,7 +72,7 @@
  * found, its members are used as-is: that's a real, exact scope to the
  * requested season/arc, not a heuristic. If NO arc-scoped category exists,
  * episodes fall back to a best-effort NUMBER filter on the wiki-wide list
- * (see filterTitlesUpToArc).
+ * (see filterTitlesToArc).
  *
  * ARC SCOPING — CHARACTERS: characters are scoped differently, in two
  * stages (see findSeasonPageCharacters / buildCharacterCategoryGuesses,
@@ -99,7 +99,7 @@
  *      first (e.g. "Charmed Season 1 Characters", "Season 1 Characters")
  *      before ever falling back to a wiki-wide "Characters" catch-all.
  *      Characters do NOT get a NUMBER-filter fallback the way episodes do
- *      (see filterTitlesUpToArc), because character-page titles essentially
+ *      (see filterTitlesToArc), because character-page titles essentially
  *      never encode a season number the way some episode titles do — a
  *      title-based filter there would almost always be a silent no-op
  *      masquerading as scoping.
@@ -517,7 +517,7 @@ function buildEpisodeCategoryGuesses(fandom, media, year, arc) {
 // guessing at a category) finds nothing — see the handler and the ARC
 // SCOPING — CHARACTERS note in the file header.
 // One-way difference from episodes: there's no equivalent of
-// filterTitlesUpToArc as a fallback here. Episode titles occasionally encode
+// filterTitlesToArc as a fallback here. Episode titles occasionally encode
 // a season/part number ("Season 5, Episode 3"); character-page titles
 // essentially never do (a character's title is just their name) — inventing
 // a number-based filter for characters would almost always be a no-op that
@@ -623,13 +623,25 @@ function extractArcNumber(arc) {
   return m ? parseInt(m[0], 10) : null;
 }
 
-function filterTitlesUpToArc(titles, arc) {
+// FIX (2026-08): this used to keep every title whose encoded number was
+// <= num ("up to" the requested arc) instead of === num (just the requested
+// arc). That's a real bug, not a naming quirk: this is the fallback used
+// when NO arc-scoped category exists (see the ARC SCOPING — EPISODES note
+// in the file header) specifically to scope a wiki-wide episode list down
+// to just the one season/arc that was asked for. With <=, requesting
+// "Season 2" silently included Season 1's episodes too (and "Season 5"
+// included 1-5) — on any wiki without a clean per-season episode category,
+// e.g. Stranger Things and Saved by the Bell. Titles with NO detectable
+// number still pass through (`if (!m) return true`) since those can't be
+// judged one way or the other and dropping them would just as silently
+// under-scope the corpus instead.
+function filterTitlesToArc(titles, arc) {
   const num = extractArcNumber(arc);
   if (num == null) return titles;
   return titles.filter((title) => {
     const m = title.match(/(?:season|s|arc|part|book|volume)\s*0*(\d+)/i);
     if (!m) return true;
-    return parseInt(m[1], 10) <= num;
+    return parseInt(m[1], 10) === num;
   });
 }
 
@@ -1278,7 +1290,7 @@ export default async function handler(req, res) {
     // fixes that at the source.
     //
     // `resolvedArc` is what every guess-builder below uses. The original
-    // `arc` is deliberately still used for: filterTitlesUpToArc (the
+    // `arc` is deliberately still used for: filterTitlesToArc (the
     // NUMBER-based episode fallback, which needs an actual digit —
     // "Breakaway" has none), and everything echoed back to the caller (the
     // response's own `arc` field, `arcResolvedTitle` for debugging) so a
@@ -1302,7 +1314,7 @@ export default async function handler(req, res) {
       episodeTitles = episodeCategoryResult.found.members;
       if (arc && !episodeCategoryResult.found.arcScoped) {
         const beforeCount = episodeTitles.length;
-        episodeTitles = filterTitlesUpToArc(episodeTitles, arc);
+        episodeTitles = filterTitlesToArc(episodeTitles, arc);
         warnings.push(
           `No category specific to "${resolvedArc}"${resolvedArc !== arc ? ` (resolved from "${arc}")` : ''} — filtered "${arc}" by number instead (best-effort).`
         );
