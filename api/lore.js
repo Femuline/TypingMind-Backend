@@ -117,6 +117,33 @@
  * findSeasonPageCharacters and looksLikeNonCharacterTitle) — noisier, but
  * still scoped to this season's own page rather than the wiki-wide fallback.
  *
+ * NON-CHARACTER PAGE FILTERING (both stages above): neither ARC SCOPING
+ * mechanism above actually verifies that a discovered link points at a
+ * character page — a season page's Cast/Characters section is written
+ * "Actor as Character," so the actor's own bio page rides along right next
+ * to every real character link, and a recurring/minor character's entry can
+ * cite their debut episode by name. Both are shaped exactly like a valid
+ * character title, so looksLikeNonCharacterTitle's title-shape filter can't
+ * catch either one — confirmed on Charmed itself: actor bios like "Holly
+ * Marie Combs" sit right next to character links in a season's own Cast and
+ * Characters section, and every Charmed episode page has a "Notes and
+ * Trivia" section, so an episode title that slipped into characterTitles
+ * would still pass fetchCharacterBullets's "found nothing" check (Trivia
+ * alone counts as content) and get upserted into lore_characters right
+ * alongside real characters. Two backstops in the handler run on
+ * characterTitles before any page in it gets fetched/cached, regardless of
+ * which stage produced the list: an episode cross-check (drops anything
+ * already in this same call's episodeTitles — a title can never
+ * legitimately be both) and filterOutRealWorldPages (drops titles whose OWN
+ * Fandom categories mark them as real-world cast/crew rather than an
+ * in-universe character — e.g. "Category:Performers" on charmed.fandom.com).
+ * Both run BEFORE extraCharacters is merged in, since that's a manual,
+ * exact-title override meant to bypass discovery entirely and shouldn't be
+ * second-guessed by either check. The category check makes its own Fandom
+ * API calls, so — unlike the free, in-memory episode cross-check — it's
+ * skipped under dryRun (see dryRun below); the real fetch/cache path always
+ * runs it before writing anything to lore_characters.
+ *
  * Resolves the Fandom wiki for `fandom`, figures out which episode/character
  * pages belong to `arc` (e.g. "Season 6"), and makes sure each one is cached
  * in Supabase (lore_wikis / lore_characters / lore_episodes / lore_categories).
@@ -243,6 +270,24 @@ const CHARACTER_SECTION_GROUPS = {
 // match a longer heading like "Cast and Characters" or "Characters and Cast"
 // on its own, so this list doesn't need to be exhaustive.
 const SEASON_CHARACTER_SECTION_NAMES = ['Cast and Characters', 'Characters', 'Cast', 'Main Cast', 'Starring Cast', 'Series Regulars'];
+
+// Category-name patterns that mean "this page is about the real-world
+// person/team who made the show, not an in-universe character" — used by
+// filterOutRealWorldPages to catch actor/crew bio pages that
+// looksLikeNonCharacterTitle's title-shape check can't (a real person's name
+// is shaped exactly like a character's). Deliberately broad/exclusion-based,
+// same philosophy as looksLikeNonCharacterTitle's own comment: positively
+// proving "this is a fictional character" is far more error-prone across
+// different fandoms than excluding the handful of ways wikis label real
+// people. Confirmed against charmed.fandom.com, where actor bios (e.g.
+// "Holly Marie Combs") are filed under "Category:Performers".
+const NON_CHARACTER_CATEGORY_PATTERN = /\b(performers?|actors?|actresses?|real[\s-]?world|crew|cast\s*(?:and|&)?\s*crew|behind[\s-]?the[\s-]?scenes|production\s*(?:staff|team)?|directors?|writers?|producers?|creators?)\b/i;
+
+// MediaWiki's prop=categories accepts multiple pipe-separated titles per
+// request, capped at 50 for anonymous/non-bot callers (500 needs
+// apihighlimits, which this script's plain fetch() calls don't have) — see
+// fetchCategoriesForTitles.
+const CATEGORY_CHECK_BATCH = 50;
 
 const ALLOWED_ORIGINS = ['https://www.typingmind.com'];
 
@@ -757,6 +802,95 @@ async function findSeasonPageCharacters(subdomain, pageGuesses, warnings) {
   return { pageTitle: null, titles: [], tier: null };
 }
 
+// Batched category lookup for a list of exact page titles — used by
+// filterOutRealWorldPages below. MediaWiki's prop=categories accepts
+// multiple pipe-separated titles in ONE request, so checking N candidate
+// titles costs ceil(N/CATEGORY_CHECK_BATCH) requests total, not one per
+// title — and this runs once at character-DISCOVERY time, not inside the
+// per-page BATCH_SIZE fetch loop, so it doesn't compete with that budget.
+// clshow=!hidden excludes hidden maintenance/tracking categories (added
+// automatically by templates, not meaningful editorial categorization) so
+// only categories an editor actually chose to file the page under come
+// back.
+async function fetchCategoriesForTitles(subdomain, titles) {
+  const byTitle = {};
+  for (let i = 0; i < titles.length; i += CATEGORY_CHECK_BATCH) {
+    const chunk = titles.slice(i, i + CATEGORY_CHECK_BATCH);
+    const url = `https://${subdomain}.fandom.com/api.php?action=query&prop=categories&clshow=!hidden&cllimit=max&redirects=1&titles=${encodeURIComponent(chunk.join('|'))}&format=json`;
+    const data = await apiRequest(url);
+    const query = (data && data.query) || {};
+    const pages = query.pages || {};
+
+    // A requested title can come back filed under a DIFFERENT title than
+    // what was asked for, in two ways that can both apply to the same title
+    // in sequence: `normalized` (case/underscore normalization — e.g.
+    // Fandom always capitalizes the first letter) and `redirects` (the
+    // title is itself a redirect to a different page entirely). Map each
+    // requested title in `chunk` to whichever title its category data
+    // actually landed under, so results below aren't silently dropped just
+    // because the title round-tripped differently than it went in.
+    const canonical = {};
+    for (const t of chunk) canonical[t] = t;
+    for (const n of query.normalized || []) {
+      if (canonical[n.from] !== undefined) canonical[n.from] = n.to;
+    }
+    for (const r of query.redirects || []) {
+      for (const t of chunk) {
+        if (canonical[t] === r.from) canonical[t] = r.to;
+      }
+    }
+
+    const categoriesByResolvedTitle = {};
+    for (const page of Object.values(pages)) {
+      if (!page || !page.title) continue;
+      categoriesByResolvedTitle[page.title] = (page.categories || []).map((c) => c.title.replace(/^Category:/, ''));
+    }
+    for (const t of chunk) {
+      const cats = categoriesByResolvedTitle[canonical[t]];
+      if (cats) byTitle[t] = cats;
+    }
+  }
+  return byTitle;
+}
+
+// Drops candidate character titles that are actually real-world cast/crew
+// pages (an actor's own bio page, most commonly) by checking each page's
+// OWN Fandom categories, rather than guessing from the shape of its title
+// the way looksLikeNonCharacterTitle does. This is what catches the case
+// that function's own comment flags as unfixable at that layer: "Holly
+// Marie Combs" is shaped exactly like a character's name, so no title-shape
+// check can rule her out — but her actual page IS filed under
+// "Category:Performers" on charmed.fandom.com (confirmed), which this CAN
+// see and looksLikeNonCharacterTitle can't.
+//
+// Titles that come back with NO categories at all (nonexistent page, a wiki
+// that doesn't tag consistently, or the categories lookup itself failing)
+// are passed through unchanged — this only ever REMOVES a title it can
+// positively identify as real-world via a known pattern; it never requires
+// positive proof that a title IS a character, the same allow-by-exclusion
+// philosophy as looksLikeNonCharacterTitle.
+async function filterOutRealWorldPages(subdomain, titles, warnings) {
+  if (!titles.length) return titles;
+  let byTitle;
+  try {
+    byTitle = await fetchCategoriesForTitles(subdomain, titles);
+  } catch (err) {
+    warnings.push(`Couldn't check page categories to filter actor/crew pages out of the character list: ${err.message} — the character list below may include some.`);
+    return titles;
+  }
+  const dropped = [];
+  const kept = titles.filter((title) => {
+    const cats = byTitle[title];
+    const isRealWorld = !!cats && cats.some((c) => NON_CHARACTER_CATEGORY_PATTERN.test(c));
+    if (isRealWorld) dropped.push(title);
+    return !isRealWorld;
+  });
+  if (dropped.length) {
+    warnings.push(`${dropped.length} link(s) removed from the character list because their own page is categorized as real-world cast/crew, not an in-universe character: ${dropped.join(', ')}`);
+  }
+  return kept;
+}
+
 async function fetchIntroExtract(subdomain, title) {
   const url = `https://${subdomain}.fandom.com/api.php?action=query&prop=extracts&explaintext=1&exintro=1&redirects=1&titles=${encodeURIComponent(title)}&format=json`;
   const data = await apiRequest(url);
@@ -1172,6 +1306,40 @@ export default async function handler(req, res) {
       }
     }
 
+    // Backstop 1: cross-check against episodeTitles (already fully resolved
+    // above, including extraEpisodes — zero extra API cost, just a Set
+    // lookup). A title can never legitimately be both an episode AND a
+    // character, so any overlap here is an episode page that leaked into
+    // the character list — see the NON-CHARACTER PAGE FILTERING note in
+    // this file's header for how that happens on a wiki like Charmed's.
+    // Catches the leak regardless of which discovery path (season-page
+    // section, season-page whole-page, or category) produced it.
+    if (characterTitles.length && episodeTitles.length) {
+      const episodeTitleSet = new Set(episodeTitles);
+      const before = characterTitles.length;
+      characterTitles = characterTitles.filter((t) => !episodeTitleSet.has(t));
+      if (characterTitles.length !== before) {
+        warnings.push(
+          `${before - characterTitles.length} title(s) removed from the character list because they're also in this call's episode list — they're episode pages, not character pages.`
+        );
+      }
+    }
+    // Backstop 2: filterOutRealWorldPages — drops actor/crew bio pages by
+    // checking each remaining title's own Fandom categories (see that
+    // function's comment). This makes its own Fandom API calls, so it's
+    // skipped under dryRun, which promises not to touch individual pages
+    // beyond the episode/character CATEGORY listing (see dryRun below) —
+    // the real fetch/cache path a few lines down always runs it before
+    // anything gets upserted into lore_characters, which is what actually
+    // matters for keeping the table clean.
+    if (characterTitles.length && !dryRun) {
+      characterTitles = await filterOutRealWorldPages(wiki.subdomain, characterTitles, warnings);
+    }
+    // Both backstops run BEFORE extraCharacters is merged in below:
+    // extraCharacters is a manual, exact-title override meant to bypass
+    // discovery entirely (see that param's doc comment at the top of this
+    // file), so neither check should second-guess a title the caller listed
+    // explicitly.
     const extraCharacterTitles = normalizeExtraTitles(extraCharacters);
     if (extraCharacterTitles.length) {
       const have = new Set(characterTitles);
