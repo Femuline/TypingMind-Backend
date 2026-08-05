@@ -27,33 +27,10 @@
  *      once and not a size-capped chunk of it.
  *
  * DEBUGGING:
- * Start with `await window.LoreFetchDiagnose()`. It asks the server what it
- * thinks should exist versus what's actually in Supabase for the current
- * chat's fandom/arc, and prints the gaps: every episode-category guess and
- * its member count (not just the first one that won), which lore_wikis row
- * is in use, whether OTHER lore_wikis rows also match this fandom, which
- * resolved titles have no row, which rows have an empty plot, and what
- * `arc` values are actually stored. Read that before reaching for
- * LoreFetchRefresh() — it tells you whether the problem is category
- * resolution, page fetching, or where you're looking in the table.
- * Reading the output, in order:
- *   - arcValuesInDb is {"(null)": N} or a different season → the rows are
- *     there; your query's arc filter is what's wrong.
- *   - wikiCandidates lists more than one row with episodes → duplicate
- *     lore_wikis rows; the badge and your query are reading different
- *     wiki_ids.
- *   - episodeCategoryWinner.arcScoped is false and arcFilterApplied says
- *     "no-op" → you have the whole series, not the requested arc, and the
- *     titles aren't the ones you expect.
- *   - missingFromDb is non-empty → a genuine fetch/cache failure; that's
- *     what LoreFetchRefresh() is for.
- *   - everything looks right but totalEpisodeRowsForWiki is 0 → the
- *     deployment is pointed at a different Supabase project than the
- *     dashboard you're looking at.
  * After any fetch (successful or not), the exact text that was/would be
- * injected is on `window.LoreFetchLastContext`, that run's warnings on
- * `window.LoreFetchLastWarnings`, and the last diagnosis on
- * `window.LoreFetchLastDiagnosis`.
+ * injected is on `window.LoreFetchLastContext`, and that run's warnings
+ * on `window.LoreFetchLastWarnings` — check these directly rather than
+ * hunting through console output.
  * Run `window.LoreFetchDebug = true` in the console for a step-by-step
  * trace (persists across reloads).
  * Run `window.LoreFetchInspectMessages(chatId)` to print the raw chat
@@ -67,6 +44,17 @@
  * category got cached — a code fix alone won't change what's already
  * cached, so this (or manually clearing the relevant lore_categories /
  * lore_episodes rows) is required to actually pick up the fix.
+ * Run `window.LoreFetchCheckMissing()` for a READ-ONLY check of what's
+ * actually sitting in Supabase for the current chat's fandom/arc right now
+ * — no Fandom fetches, no writes, so it can't show you a false positive the
+ * way the badge theoretically could. Prints a per-title table to the
+ * console (also on `window.LoreFetchLastCheck`) with each title marked ok /
+ * stale / cached-empty / missing. If the badge claims N episodes loaded but
+ * this says otherwise, the disagreement is happening below this script —
+ * most likely the deployed lore.js is pointed at a different Supabase
+ * project than whatever you're checking by hand, or a query against
+ * lore_episodes is filtering on `arc` with different casing than what got
+ * written (parseSystemPrompt below always title-cases it, e.g. "Season 5").
  * A badge showing amber with "Lore — incomplete" (not the green "Lore
  * fetched") means an arc was requested but 0 episodes were resolved for
  * it — only character info made it into context. Click the badge (or
@@ -92,17 +80,8 @@
   // though the real cause is the extra slash.
   const LORE_API_BASE = 'https://typingmind-backend.vercel.app';
 
-  // Only needed if you set LORE_DIAGNOSE_TOKEN on the server to gate
-  // mode:'diagnose' (see the SECURITY note in lore.js's header). Leave null
-  // if you didn't. Sent as the x-lore-token header on diagnose calls only.
-  const LORE_DIAGNOSE_TOKEN = null;
-
   // ---------- Tunables ----------
   const REQUEST_TIMEOUT_MS = 25000; // a single batch call to /api/lore, including its own Fandom fetches server-side
-  // Diagnose probes EVERY category guess instead of stopping at the first
-  // hit (~10 Fandom calls on a cold cache), so it needs more headroom than
-  // a normal batch call before we call it dead.
-  const DIAGNOSE_TIMEOUT_MS = 45000;
   const RECHECK_INTERVAL_MS = 3000; // how often to poll while waiting for chat/agent data (or the next fetch batch)
   const RECHECK_DURATION_MS = 30000; // how long to keep polling for chat/agent data before giving up
   const ENTITY_RESCAN_MS = 5000; // once lore is loaded, how often to re-scan the chat for mentions and refresh the injection
@@ -275,29 +254,20 @@
   // Calls your api/lore.js. That endpoint only does a small batch of Fandom
   // page fetches per call (see its own comment header for why), so this
   // loops until it reports done:true, surfacing progress via onProgress.
-  async function callLoreApiOnce(params, opts) {
-    const timeoutMs = (opts && opts.timeoutMs) || REQUEST_TIMEOUT_MS;
+  async function callLoreApiOnce(params) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    const headers = { 'Content-Type': 'application/json' };
-    if (opts && opts.token) headers['x-lore-token'] = opts.token;
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
       const res = await fetch(`${LORE_API_BASE}/api/lore`, {
         method: 'POST',
-        headers,
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params),
         signal: controller.signal,
       });
-      // Don't throw on a non-2xx before reading the body — lore.js returns
-      // its own {error} JSON with a 401/500, and that message is far more
-      // useful than a bare status code.
-      const data = await res.json().catch(() => null);
-      if (!res.ok) {
-        throw new Error((data && data.error) || `lore API HTTP ${res.status}`);
-      }
-      return data;
+      if (!res.ok) throw new Error(`lore API HTTP ${res.status}`);
+      return await res.json();
     } catch (err) {
-      if (err.name === 'AbortError') throw new Error(`lore API request timed out after ${Math.round(timeoutMs / 1000)}s`);
+      if (err.name === 'AbortError') throw new Error('lore API request timed out');
       throw err;
     } finally {
       clearTimeout(timeoutId);
@@ -385,7 +355,7 @@
         if (stalledRounds >= STALL_ROUNDS) {
           const stuckOn = lastAttempted.length ? ` Stuck on: ${lastAttempted.join(' | ')}.` : '';
           const err = new Error(
-            `stuck at ${progressCount}/${result.total} for ${STALL_ROUNDS} rounds straight — one or more pages are failing every attempt, including the fallback that's supposed to cache the failure so it can be skipped.${stuckOn} Recent warnings: ${summarizeWarnings(allWarnings)} — run await window.LoreFetchDiagnose() for a full picture.`
+            `stuck at ${progressCount}/${result.total} for ${STALL_ROUNDS} rounds straight — one or more pages are failing every attempt, including the fallback that's supposed to cache the failure so it can be skipped.${stuckOn} Recent warnings: ${summarizeWarnings(allWarnings)}`
           );
           err.warnings = allWarnings;
           throw err;
@@ -472,117 +442,6 @@
     return entry.value;
   };
 
-  // ================= Chat -> agent -> lore params =================
-  // Walks chat record -> linked agent -> parsed {arc, year, media, fandom}.
-  // Shared by the normal load path and LoreFetchDiagnose so the diagnostic
-  // is guaranteed to be asking about the exact same params a real fetch
-  // would use — a separately-written copy of this chain could drift and
-  // then "diagnose" something the fetcher never actually requested.
-  // Status values match what loadCorpusForChat reports to the badge:
-  // 'no-chat' | 'no-agent' | 'skipped' | 'ok'.
-  async function getChatLoreParams(chatId) {
-    const chatEntry = await resolveStorageKey(chatId);
-    if (!chatEntry) return { status: 'no-chat' };
-
-    const agentId = chatEntry.value.character && chatEntry.value.character.id;
-    if (!agentId) return { status: 'no-agent' };
-
-    const agent = await resolveAgentRecord(agentId);
-    if (!agent || !agent.instruction) return { status: 'no-agent' };
-
-    const parsed = parseSystemPrompt(agent.instruction);
-    if (!parsed || !parsed.fandom) return { status: 'skipped' };
-
-    return { status: 'ok', chatEntry, agentId, parsed };
-  }
-
-  // ================= Diagnostics =================
-  // Asks the server what it thinks should exist versus what's actually in
-  // Supabase for the CURRENT chat's fandom/arc, then prints the gaps.
-  // Purely read-only on the episode/character tables — safe to run any
-  // time, including mid-fetch. See this file's header for how to read the
-  // output. Returns the raw report (also parked on
-  // window.LoreFetchLastDiagnosis) so you can poke at it yourself.
-  window.LoreFetchDiagnose = async function (chatId) {
-    const resolved = await getChatLoreParams(chatId || getCurrentChatId());
-    if (resolved.status !== 'ok') {
-      const why = {
-        'no-chat': "no chat record yet — a brand-new chat isn't stored until you send a message",
-        'no-agent': "this chat isn't linked to an agent with instructions",
-        skipped: "this agent's instructions don't match the fandom template",
-      };
-      console.warn(`[LoreFetch] can't diagnose: ${why[resolved.status] || resolved.status}`);
-      return null;
-    }
-
-    console.log('%c[LoreFetch] diagnosing…', 'color:#f0b429;font-weight:bold', resolved.parsed);
-    let report;
-    try {
-      report = await callLoreApiOnce(
-        { ...resolved.parsed, mode: 'diagnose' },
-        { timeoutMs: DIAGNOSE_TIMEOUT_MS, token: LORE_DIAGNOSE_TOKEN }
-      );
-    } catch (err) {
-      console.error('[LoreFetch] diagnose request failed:', (err && err.message) || err);
-      return null;
-    }
-    window.LoreFetchLastDiagnosis = report;
-
-    if (report.error) {
-      console.error('[LoreFetch] diagnose failed:', report.error);
-      if (report.wikiResolveAttempts) console.error('[LoreFetch] wiki resolve attempts:', report.wikiResolveAttempts);
-      return report;
-    }
-
-    console.log('%c[LoreFetch] request', 'font-weight:bold', report.request);
-    console.log('%c[LoreFetch] wiki used', 'font-weight:bold', report.wikiUsed);
-    if ((report.wikiCandidates || []).length > 1) {
-      console.warn('[LoreFetch] MULTIPLE lore_wikis rows match this fandom — episodes may be split across them:');
-      console.table(report.wikiCandidates);
-    }
-
-    console.log('%c[LoreFetch] episode category guesses (in the order they are tried)', 'font-weight:bold');
-    console.table(report.episodeCategoryProbes);
-    console.log(
-      `%c[LoreFetch] winner: ${report.episodeCategoryWinner ? report.episodeCategoryWinner.name : 'NONE'} ` +
-        `(arcScoped=${report.episodeCategoryWinner ? report.episodeCategoryWinner.arcScoped : 'n/a'}) ` +
-        `-> ${report.resolvedEpisodeCount} titles, arcFilter=${report.arcFilterApplied}`,
-      'font-weight:bold'
-    );
-    if (report.episodeCategoryWinner && report.episodeCategoryWinner.arcScoped === false && report.request.arc) {
-      console.warn(
-        `[LoreFetch] the winning category is NOT scoped to "${report.request.arc}" — these titles are probably the whole series.`
-      );
-    }
-
-    console.log('%c[LoreFetch] resolved episode titles vs. what is in the DB', 'font-weight:bold');
-    console.table(report.episodes);
-
-    console.log('%c[LoreFetch] arc values as actually stored in lore_episodes', 'font-weight:bold', report.arcValuesInDb);
-    console.log(`[LoreFetch] ${report.totalEpisodeRowsForWiki} total episode rows exist for wiki_id ${report.wikiUsed.id}`);
-    console.log(
-      '%c[LoreFetch] character category winner', 'font-weight:bold',
-      report.characterCategoryWinner || 'NONE'
-    );
-
-    if ((report.missingFromDb || []).length) {
-      console.warn('[LoreFetch] resolved but NOT in the DB (real fetch/cache failure — LoreFetchRefresh() is for this):', report.missingFromDb);
-    }
-    if ((report.inDbButEmptyPlot || []).length) {
-      console.warn('[LoreFetch] in the DB but the plot column is empty (placeholder from a failed fetch):', report.inDbButEmptyPlot);
-    }
-    if ((report.orphanRowsSample || []).length) {
-      console.info('[LoreFetch] rows for this wiki that the current arc request does NOT ask for:', report.orphanRowsSample);
-    }
-    if (!(report.missingFromDb || []).length && !(report.inDbButEmptyPlot || []).length && report.resolvedEpisodeCount > 0) {
-      console.log(
-        '%c[LoreFetch] every resolved episode has a row with plot text. If you cannot find them in the table, check wiki_id and the arc values printed above (or whether this deployment points at the Supabase project you are browsing).',
-        'color:#45c97a'
-      );
-    }
-    return report;
-  };
-
   // Forces a full re-check of the CURRENT chat's lore, bypassing lore.js's
   // 14-day Supabase cache for category resolution AND every episode/
   // character page (forceRefresh:true — see lore.js's file header). Use
@@ -593,8 +452,7 @@
   // naturally expires. This re-fetches EVERY episode and character for the
   // arc from Fandom again, not just the ones that look missing, so expect
   // it to take a while (and to make a real batch of requests against
-  // Fandom) for a full season. Run LoreFetchDiagnose() first — it's
-  // read-only and usually identifies the problem without the re-fetch.
+  // Fandom) for a full season.
   window.LoreFetchRefresh = function () {
     const chatId = getCurrentChatId();
     if (!chatId) {
@@ -605,6 +463,78 @@
     stopRechecking();
     currentChatId = chatId; // checkForChatChange() below is a no-op unless the id actually changes, so set it directly
     onChatOpened(chatId, { forceRefresh: true });
+  };
+
+  // Read-only Supabase check for the CURRENT chat's fandom/arc — does not
+  // touch Fandom, does not write anything, does not affect the badge/rescan
+  // loop at all. This exists specifically to settle "the extension says N
+  // episodes are loaded, but I don't see them in the database" — since that
+  // combination shouldn't be possible from lore.js's own logic (a done:true
+  // response only ever reports rows it just read from Supabase), the most
+  // likely explanations are things that live BETWEEN you and the database
+  // rather than in the fetch/write path itself: this deployment's Vercel
+  // env vars pointing at a different Supabase project than the one you're
+  // looking at, or a manual query filtering `arc` with different casing
+  // than parseSystemPrompt produces. This command reads the same rows
+  // lore.js would, under this same deployment, so it can't be fooled by
+  // either of those — if it also says "missing," the gap is real.
+  window.LoreFetchCheckMissing = async function () {
+    const chatId = getCurrentChatId();
+    if (!chatId) {
+      console.warn('[LoreFetch] No chat is currently open.');
+      return null;
+    }
+    const chatEntry = await resolveStorageKey(chatId);
+    if (!chatEntry) {
+      console.warn('[LoreFetch] No chat record found yet for this chat — has it sent a message?');
+      return null;
+    }
+    const agentId = chatEntry.value.character && chatEntry.value.character.id;
+    const agent = agentId ? await resolveAgentRecord(agentId) : null;
+    const parsed = agent && agent.instruction ? parseSystemPrompt(agent.instruction) : null;
+    if (!parsed) {
+      console.warn("[LoreFetch] This chat's agent instructions don't match the fandom template — nothing to check.");
+      return null;
+    }
+    console.log('%c[LoreFetch] Checking Supabase (read-only) for', 'color:#f0b429;font-weight:bold', parsed);
+    let result;
+    try {
+      result = await callLoreApiOnce({ ...parsed, dryRun: true });
+    } catch (err) {
+      console.error('[LoreFetch] check request failed:', err);
+      return null;
+    }
+    if (result.error) {
+      console.error('[LoreFetch] check failed:', result.error);
+      return result;
+    }
+    window.LoreFetchLastCheck = result;
+    console.log(
+      `%c[LoreFetch] Episode category: ${result.episodeCategory || '(none found)'}` +
+        `${result.episodeCategory ? (result.episodeCategoryArcScoped ? ' — arc-scoped' : ' — NOT arc-scoped, likely whole-series') : ''}`,
+      'color:#7dd3fc'
+    );
+    if (result.episodeStatus && result.episodeStatus.length) console.table(result.episodeStatus);
+    if (result.characterStatus && result.characterStatus.length) console.table(result.characterStatus);
+    if (result.missingEpisodes.length) {
+      console.warn(
+        `%c[LoreFetch] ${result.missingEpisodes.length}/${result.episodesRequested} episode title(s) are NOT usable in Supabase right now (missing, cached-empty, or stale):`,
+        'color:#f04545;font-weight:bold',
+        result.missingEpisodes
+      );
+    } else if (result.episodesRequested > 0) {
+      console.log(
+        '%c[LoreFetch] Every requested episode title has a real row with plot text in Supabase — the DB agrees with the badge. If your own check still shows nothing, check that it is reading the SAME Supabase project this deployment uses, and that any `arc` filter matches the casing lore.js writes (e.g. "Season 5", not "season 5").',
+        'color:#45c97a'
+      );
+    } else {
+      console.warn('[LoreFetch] episodesRequested is 0 — the episode category itself was never resolved, so there was nothing to check episode-by-episode. See warnings below.');
+    }
+    if (result.missingCharacters.length) {
+      console.warn(`[LoreFetch] ${result.missingCharacters.length}/${result.charactersRequested} character title(s) are NOT usable in Supabase right now:`, result.missingCharacters);
+    }
+    if (result.warnings && result.warnings.length) console.log('[LoreFetch] warnings:', result.warnings);
+    return result;
   };
 
   // ================= Sidebar icon (matches TypingMind's own nav tabs) =================
@@ -635,9 +565,9 @@
       console.warn(
         '[LoreFetch] Could not find the sidebar to anchor next to (looked for a "Sync" nav tab), ' +
         'so no status icon will show. Fetching/injection still runs — check window.LoreFetchLastContext ' +
-        'and window.LoreFetchLastWarnings, run await window.LoreFetchDiagnose(), or set ' +
-        'window.LoreFetchDebug = true for a full trace. If you can, right-click the Sync icon in your ' +
-        'sidebar, Inspect it, and share the outer HTML so the selector can be corrected.'
+        'and window.LoreFetchLastWarnings, or run window.LoreFetchDebug = true for a full trace. If you ' +
+        'can, right-click the Sync icon in your sidebar, Inspect it, and share the outer HTML so the ' +
+        'selector can be corrected.'
       );
     }
     return null;
@@ -668,4 +598,474 @@
       border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.4; display: none;
       box-shadow: 0 4px 16px rgba(0,0,0,0.4);
     `;
-    document.body.appendCh
+    document.body.appendChild(popover);
+    document.addEventListener('click', (e) => {
+      const trigger = document.getElementById('lorefetch-tab');
+      if (trigger && !trigger.contains(e.target) && !popover.contains(e.target)) {
+        popover.style.display = 'none';
+      }
+    });
+    return popover;
+  }
+
+  function togglePopoverNear(triggerEl) {
+    const popover = buildPopover();
+    if (popover.style.display === 'block') {
+      popover.style.display = 'none';
+      return;
+    }
+    // buildPopover() only ever creates an empty shell — refresh its content
+    // here on every open, otherwise a popover built before any badge-state
+    // detail existed yet would stay blank forever, even after later errors.
+    popover.innerHTML = lastBadgeDetail || 'No details yet.';
+    const rect = triggerEl.getBoundingClientRect();
+    popover.style.left = `${Math.min(rect.right + 8, window.innerWidth - 296)}px`;
+    popover.style.top = `${Math.max(rect.top, 8)}px`;
+    popover.style.display = 'block';
+  }
+
+  // Confirmed (by comparing the real "Prompts" tab's markup in both sidebar
+  // states) that collapsed vs. expanded aren't the same DOM with a label
+  // toggled by CSS — they're two structurally different renders:
+  //   collapsed: "...w-9 h-9 items-center justify-center...", carries
+  //     data-tooltip-content="Prompts", no <span> at all.
+  //   expanded:  "...flex-col justify-start items-center...gap-1.5...",
+  //     no data-tooltip-content attribute, plus <span>Prompts</span>.
+  // A one-time clone can never track that on its own, since it isn't part
+  // of TypingMind's React render cycle — so instead we keep re-copying the
+  // anchor's current chrome (classes, tooltip attribute, label span) onto
+  // our clone every time the anchor itself changes. Only the icon and the
+  // status dot are ours; everything else mirrors the anchor exactly.
+  function directChildSpan(el) {
+    for (const child of el.children) {
+      if (child.tagName === 'SPAN') return child;
+    }
+    return null;
+  }
+
+  function applyAnchorChrome(btn, anchor) {
+    btn.className = anchor.className;
+
+    if (anchor.hasAttribute('data-tooltip-content')) {
+      btn.setAttribute('data-tooltip-content', 'Lore');
+    } else {
+      btn.removeAttribute('data-tooltip-content');
+    }
+
+    const anchorLabel = directChildSpan(anchor);
+    let ourLabel = directChildSpan(btn);
+    if (anchorLabel) {
+      if (!ourLabel) {
+        ourLabel = document.createElement('span');
+        btn.appendChild(ourLabel);
+      }
+      ourLabel.className = anchorLabel.className;
+      const style = anchorLabel.getAttribute('style');
+      if (style) ourLabel.setAttribute('style', style);
+      ourLabel.textContent = 'Lore';
+    } else if (ourLabel) {
+      ourLabel.remove();
+    }
+  }
+
+  function watchAnchorForLayoutChanges(btn, anchor) {
+    const sync = () => requestAnimationFrame(() => applyAnchorChrome(btn, anchor));
+    if (typeof ResizeObserver !== 'undefined') {
+      new ResizeObserver(sync).observe(anchor.parentNode || anchor);
+    }
+    new MutationObserver(sync).observe(anchor, {
+      attributes: true,
+      attributeFilter: ['class', 'data-tooltip-content'],
+      childList: true,
+      subtree: true,
+    });
+    window.addEventListener('resize', sync);
+  }
+
+  // Real sidebar tab, cloned from the anchor so it inherits its exact
+  // spacing, sizing, and collapsed/expanded layout — then we only swap the
+  // icon and label text, and keep re-syncing chrome from the anchor (see
+  // applyAnchorChrome above) since the anchor's own markup changes shape
+  // between collapsed and expanded sidebar states.
+  function ensureSidebarButton() {
+    let btn = document.getElementById('lorefetch-tab');
+    if (btn) return btn;
+
+    const anchor = findSidebarAnchor();
+    if (!anchor || !anchor.parentNode) return null; // sidebar not mounted yet — caller will fall back/retry
+
+    btn = anchor.cloneNode(true);
+    btn.id = 'lorefetch-tab';
+    btn.removeAttribute('onclick');
+    btn.removeAttribute('href');
+    btn.setAttribute('data-element-id', 'workspace-tab-lore');
+    btn.setAttribute('aria-selected', 'false');
+    btn.setAttribute('aria-label', 'Lore');
+    // Cloning copies id attributes too (e.g. a status dot) — duplicate ids
+    // are invalid HTML and can confuse later querySelector('#...') calls,
+    // so strip every id from inside the clone before we add our own.
+    btn.querySelectorAll('[id]').forEach((el) => el.removeAttribute('id'));
+
+    const svgHolder = btn.querySelector('svg');
+    if (svgHolder) {
+      const iconWrap = svgHolder.parentElement;
+      const tmp = document.createElement('div');
+      tmp.innerHTML = LORE_ICON_SVG.trim();
+      svgHolder.replaceWith(tmp.firstElementChild);
+      if (iconWrap) {
+        iconWrap.style.position = iconWrap.style.position || 'relative';
+        const dot = document.createElement('div');
+        dot.id = 'lorefetch-status-dot';
+        dot.style.cssText = 'position:absolute; top:-2px; right:-2px; width:6px; height:6px; border-radius:50%; background:#9ca3af; display:block;';
+        iconWrap.appendChild(dot);
+      }
+    }
+
+    applyAnchorChrome(btn, anchor);
+
+    anchor.insertAdjacentElement('afterend', btn);
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      togglePopoverNear(btn);
+    });
+    watchAnchorForLayoutChanges(btn, anchor);
+    return btn;
+  }
+
+  const BADGE_COLORS = { idle: '#9ca3af', working: '#f0b429', success: '#45c97a', partial: '#f0b429', skipped: '#9ca3af', error: '#f04545' };
+  const BADGE_TOOLTIPS = {
+    idle: 'Lore',
+    working: 'Fetching lore…',
+    success: 'Lore fetched',
+    partial: 'Lore — incomplete (0 episodes found)',
+    skipped: 'Lore — not applicable',
+    error: 'Lore — error',
+  };
+
+  // Remembered separately from the DOM so that whenever the real tab shows
+  // up (see watchForSidebarMount below), it can be brought up to date
+  // immediately instead of sitting on the default idle-gray dot until the
+  // next chat/agent event happens to fire.
+  let lastBadgeState = 'idle';
+  let lastBadgeDetail = null;
+
+  function applyBadgeState(indicator) {
+    if (!indicator) return;
+    const color = BADGE_COLORS[lastBadgeState] || BADGE_COLORS.idle;
+    const dot = indicator.querySelector('#lorefetch-status-dot');
+    if (dot) dot.style.background = color;
+    indicator.title = BADGE_TOOLTIPS[lastBadgeState] || 'Lore';
+    const popover = document.getElementById('lorefetch-popover');
+    if (popover && lastBadgeDetail) popover.innerHTML = lastBadgeDetail;
+  }
+
+  function setBadgeState(state, detailHtml) {
+    lastBadgeState = state;
+    if (detailHtml) lastBadgeDetail = detailHtml;
+    applyBadgeState(ensureSidebarButton()); // no-ops safely if the sidebar isn't mounted yet
+  }
+
+  // Creates the real tab the instant TypingMind's own sidebar shows up,
+  // rather than waiting for the next chat/agent event to happen to trigger
+  // setBadgeState (which could be up to RECHECK_INTERVAL_MS behind — the
+  // beat of delay you were seeing right after a refresh). Watching the
+  // whole document is broad, but this is a one-shot check that disconnects
+  // itself the moment the tab exists, so the overhead is short-lived.
+  function watchForSidebarMount() {
+    if (ensureSidebarButton()) {
+      applyBadgeState(document.getElementById('lorefetch-tab'));
+      return;
+    }
+    const observer = new MutationObserver(() => {
+      const btn = ensureSidebarButton();
+      if (btn) {
+        observer.disconnect();
+        applyBadgeState(btn);
+      }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  // ================= Injection into the chat =================
+  function stripPreviousInjection(text) {
+    const idx = text.indexOf(MARKER_PREFIX);
+    return idx === -1 ? text : text.slice(0, idx).trim();
+  }
+
+  // Loads (and caches on the in-memory `state`) the full lore corpus for a
+  // chat's agent, then does one entity-match/write pass. Returns nothing —
+  // all outcomes are communicated via setBadgeState, same as before.
+  // `forceRefresh`, when true, is forwarded straight to /api/lore so it
+  // bypasses the server's 14-day category/page cache — see window.LoreFetchRefresh().
+  async function loadCorpusForChat(chatId, isStale, forceRefresh) {
+    const chatEntry = await resolveStorageKey(chatId);
+    if (!chatEntry) return { status: 'no-chat' };
+    const chat = chatEntry.value;
+
+    const agentId = chat.character && chat.character.id;
+    if (!agentId) return { status: 'no-agent' };
+
+    const agent = await resolveAgentRecord(agentId);
+    if (!agent || !agent.instruction) return { status: 'no-agent' };
+
+    const parsed = parseSystemPrompt(agent.instruction);
+    if (!parsed || !parsed.fandom) return { status: 'skipped' };
+
+    try {
+      const corpus = await fetchLoreCorpus(
+        forceRefresh ? { ...parsed, forceRefresh: true } : parsed,
+        (progress) => {
+          if (isStale && isStale()) return; // this chat isn't the active one anymore — don't repaint its badge
+          setBadgeState('working', `Fetching lore\u2026 ${progress.total - progress.remaining}/${progress.total} pages`);
+        },
+        isStale
+      );
+      if (corpus.warnings && corpus.warnings.length) console.log('[LoreFetch] notes:', corpus.warnings);
+      const entityIndex = buildEntityIndex(corpus);
+      window.LoreFetchLastWarnings = corpus.warnings || [];
+      if (!entityIndex.length) {
+        return { status: 'error', warnings: corpus.warnings, fandom: parsed.fandom, arc: parsed.arc };
+      }
+      // done:true only ever meant "nothing left in `missing`" — that's
+      // trivially true if the episode category was never found, so treat
+      // "an arc was requested but 0 episodes were resolved for it" as its
+      // own status instead of letting it read as a plain, unqualified
+      // success just because some characters happened to match. See the
+      // episodesRequested doc comment in lore.js's file header.
+      const episodesRequested = typeof corpus.episodesRequested === 'number' ? corpus.episodesRequested : corpus.episodes.length;
+      if (parsed.arc && episodesRequested === 0) {
+        return {
+          status: 'partial',
+          chatKey: chatEntry.key,
+          agentId,
+          parsed,
+          corpus,
+          entityIndex,
+          lastMatchedKey: null,
+          partialReason: `No episodes were found for "${parsed.arc}" — only character info is available. The episode category on ${corpus.wiki.sitename} likely wasn't matched (check the warnings below); run window.LoreFetchRefresh() after fixing/redeploying lore.js.`,
+        };
+      }
+      return { status: 'ready', chatKey: chatEntry.key, agentId, parsed, corpus, entityIndex, lastMatchedKey: null };
+    } catch (err) {
+      // fetchLoreCorpus's timeout/stall paths attach the specific per-title
+      // warnings it collected (via err.warnings) — surface those in the
+      // badge so you can see WHICH page and WHY without digging through the
+      // console. Falls back to the bare message for anything else (network
+      // errors, a genuine server-side { error } response, etc).
+      const warnings = err && err.warnings && err.warnings.length ? [...new Set(err.warnings)].slice(-8) : [(err && err.message) || String(err)];
+      return { status: 'error', warnings, fandom: parsed.fandom, arc: parsed.arc };
+    }
+  }
+
+  // One rescan/write pass for a chat whose corpus is already loaded. Skips
+  // the actual write when the matched entity set hasn't changed, both to
+  // cut down on redundant IndexedDB writes and to reduce collision risk
+  // with TypingMind's own autosave (see the file-header caveat).
+  async function rescanAndInject(state) {
+    const chatEntry = await resolveStorageKey(state.chatKey);
+    if (!chatEntry) return;
+    const chat = chatEntry.value;
+    const chatText = extractRecentChatText(chat, CHAT_TEXT_SCAN_MESSAGES);
+    const matched = matchEntities(state.entityIndex, chatText);
+    const matchedKey = matched.map((m) => `${m.type}:${m.names[0]}`).sort().join('|');
+    if (matchedKey === state.lastMatchedKey) return;
+
+    const marker = `${MARKER_PREFIX}${state.agentId}:${state.parsed.fandom}:${state.parsed.arc || ''} -->`;
+    const injected = composeInjection(matched, state.corpus.wiki, state.parsed.arc);
+    const text = injected ? `${marker}\n${injected}` : `${marker}\n(No characters or episodes from this fandom have come up in the chat yet.)`;
+    window.LoreFetchLastContext = text;
+
+    const existing = (chat.chatParams && chat.chatParams.systemMessage) || '';
+    const base = stripPreviousInjection(existing);
+    chat.chatParams = chat.chatParams || {};
+    chat.chatParams.systemMessage = base ? `${base}\n\n${text}` : text;
+    await kvPut(chatEntry.key, chat);
+    state.lastMatchedKey = matchedKey;
+
+    debugLog(`rescan: ${matched.length}/${state.entityIndex.length} entities matched ->`, matched.map((m) => m.names[0]));
+    console.log(`%c[LoreFetch] Injected ${matched.length} matching entit${matched.length === 1 ? 'y' : 'ies'}.`, 'color:#45f0a0;font-weight:bold');
+
+    // Always show the episode/character split, not just a combined count —
+    // "0 entities" was never distinguishable from "0 episodes, 3 characters"
+    // at a glance before, which is exactly how a missing-episodes bug hid
+    // behind a green badge.
+    const episodeCount = (state.corpus.episodes || []).length;
+    const characterCount = (state.corpus.characters || []).length;
+    const counts = `${episodeCount} episode${episodeCount === 1 ? '' : 's'}, ${characterCount} character${characterCount === 1 ? '' : 's'} loaded \u2014 ${matched.length} currently in context`;
+
+    if (state.status === 'partial') {
+      setBadgeState(
+        'partial',
+        `<strong>${state.parsed.fandom}</strong>${state.parsed.arc ? ' — ' + state.parsed.arc : ''}<br>${counts}<br><span style="color:#f0b429">${state.partialReason || 'Incomplete: 0 episodes were resolved for this arc.'}</span>`
+      );
+    } else {
+      setBadgeState(
+        'success',
+        `<strong>${state.parsed.fandom}</strong>${state.parsed.arc ? ' — ' + state.parsed.arc : ''}<br>${counts}`
+      );
+    }
+  }
+
+  // ================= Detect chat switches =================
+  let currentChatId = null;
+  let recheckTimer = null;
+  let rescanTimer = null;
+
+  function stopRechecking() {
+    if (recheckTimer) clearInterval(recheckTimer);
+    recheckTimer = null;
+    if (rescanTimer) clearInterval(rescanTimer);
+    rescanTimer = null;
+  }
+
+  // Bumped on every real chat switch. In-flight async work captures the
+  // value at the moment it started; if that no longer matches by the time
+  // the work resolves, a *different* chat is now active and the result is
+  // stale — discard it instead of writing it into the shared badge/timers.
+  // Without this, an old chat's late-arriving success or error can paint
+  // over whatever chat you've since switched to.
+  let activeGeneration = 0;
+
+  function onChatOpened(chatId, opts) {
+    stopRechecking();
+    const myGeneration = ++activeGeneration;
+    setBadgeState('working', 'Reading this chat\u2019s agent\u2026');
+    const wantsForceRefresh = !!(opts && opts.forceRefresh);
+    let forceRefreshConsumed = false;
+
+    let activeState = null;
+    let announcedNewChat = false;
+    // Re-entrancy guard: a single tick() can easily outlive
+    // RECHECK_INTERVAL_MS (3s) — a content-heavy fandom paginated across
+    // several categories, each batch capped at REQUEST_TIMEOUT_MS (25s),
+    // can take well over a minute end to end. Without this flag the recheck
+    // interval below fires another tick() on top of the one still running,
+    // every 3s, indefinitely — stacking up concurrent duplicate fetches
+    // against the same wiki, which is what trips Fandom's rate limit and
+    // makes the badge flap between whichever attempt happens to resolve
+    // last.
+    let tickInFlight = false;
+    const startedAt = Date.now();
+
+    const tick = () => {
+      if (tickInFlight) return;
+      tickInFlight = true;
+      // Only the very first tick of a load consumes the forceRefresh flag —
+      // fetchLoreCorpus's own internal batch loop already reuses the same
+      // (forceRefresh-tagged) params for every /api/lore call it makes
+      // within this one load, so this only needs to fire once per load, not
+      // once per RECHECK_INTERVAL_MS poll.
+      const useForceRefresh = wantsForceRefresh && !forceRefreshConsumed;
+      forceRefreshConsumed = true;
+      loadCorpusForChat(chatId, () => myGeneration !== activeGeneration, useForceRefresh)
+        .then((result) => {
+          if (myGeneration !== activeGeneration) return; // stale — a different chat is active now
+          if (result.status === 'no-chat') {
+            setBadgeState('working', 'Waiting for this chat to finish loading\u2026');
+          } else if (result.status === 'no-agent') {
+            setBadgeState('skipped', "This chat isn't linked to an agent, so there's no lore to fetch.");
+            stopRechecking();
+          } else if (result.status === 'skipped') {
+            setBadgeState('skipped', "This agent's instructions don't match the fandom template — nothing to fetch.");
+            stopRechecking();
+          } else if (result.status === 'error') {
+            const detail = (result.warnings || []).join('<br>') || 'Could not find matching wiki content.';
+            setBadgeState('error', `<strong>${result.fandom || ''}</strong><br>${detail}`);
+            stopRechecking();
+          } else if (result.status === 'ready' || result.status === 'partial') {
+            activeState = result;
+            clearInterval(recheckTimer);
+            recheckTimer = null; // corpus is loaded — the rescan loop takes over from here
+            rescanAndInject(activeState).catch((err) => console.error('[LoreFetch] rescan failed:', err));
+            rescanTimer = setInterval(() => {
+              if (myGeneration !== activeGeneration) {
+                // Chat switched since this loop started; stop painting stale data
+                // and free the interval (belt-and-suspenders — stopRechecking()
+                // on the new chat should already have cleared it, but this
+                // interval was only created because a stale generation slipped
+                // past the check above once already; don't let it run forever).
+                clearInterval(rescanTimer);
+                return;
+              }
+              rescanAndInject(activeState).catch((err) => console.error('[LoreFetch] rescan failed:', err));
+            }, ENTITY_RESCAN_MS);
+          }
+        })
+        .catch((err) => {
+          if (myGeneration !== activeGeneration) return; // stale — a different chat is active now
+          if (err && err.cancelled) return; // we deliberately stopped this load; nothing to report
+          console.error('[LoreFetch] load attempt failed:', err);
+          setBadgeState('error', String((err && err.message) || err));
+          stopRechecking();
+        })
+        .finally(() => {
+          tickInFlight = false;
+        });
+    };
+
+    tick();
+    recheckTimer = setInterval(() => {
+      if (myGeneration !== activeGeneration) {
+        clearInterval(recheckTimer);
+        return;
+      }
+      if (activeState) return; // corpus already loaded; rescanTimer owns updates now
+      if (tickInFlight) return; // previous tick hasn't resolved yet — don't pile another one on top of it
+      const timedOut = Date.now() - startedAt > RECHECK_DURATION_MS;
+      if (timedOut) {
+        // A brand-new, never-sent chat has no storage record at all yet —
+        // that's not a failure, it's just not created until you send a
+        // message. Keep quietly rechecking instead of erroring.
+        if (!announcedNewChat) {
+          announcedNewChat = true;
+          setBadgeState('skipped', "New chat — I'll fetch lore once you send your first message.");
+        }
+        tick();
+        return;
+      }
+      tick();
+    }, RECHECK_INTERVAL_MS);
+  }
+
+  function checkForChatChange() {
+    const chatId = getCurrentChatId();
+    if (chatId && chatId !== currentChatId) {
+      console.log(`[LoreFetch] chat switch detected: ${currentChatId} -> ${chatId}`);
+      currentChatId = chatId;
+      onChatOpened(chatId);
+    }
+  }
+
+  // TypingMind is a single-page app. If it updates the address bar's #chat=
+  // fragment via history.pushState()/replaceState() (the standard SPA way to
+  // change the URL without a real navigation), the browser's native
+  // 'hashchange' event never fires — per spec, pushState/replaceState never
+  // trigger hashchange or popstate on their own, only real navigations
+  // (typed URL, link click, back/forward) do. That would explain exactly the
+  // "stuck on the previous chat" symptom: checkForChatChange() correctly
+  // catches whatever chat is open at page load, but never runs again after
+  // that, no matter how many chats you open afterward.
+  //
+  // So: patch both history methods to also run our check, listen for
+  // popstate (back/forward), keep the hashchange listener too (cheap, and
+  // covers the case where the hash *is* set directly), and poll on a short
+  // interval as a last-resort safety net in case the hash changes through
+  // some other mechanism entirely.
+  function patchHistoryMethod(methodName) {
+    const original = history[methodName];
+    history[methodName] = function (...args) {
+      const result = original.apply(this, args);
+      checkForChatChange();
+      return result;
+    };
+  }
+  patchHistoryMethod('pushState');
+  patchHistoryMethod('replaceState');
+
+  watchForSidebarMount();
+  window.addEventListener('hashchange', checkForChatChange);
+  window.addEventListener('popstate', checkForChatChange);
+  setInterval(checkForChatChange, HASH_POLL_MS);
+  checkForChatChange(); // in case a chat is already open when this extension loads
+})();
