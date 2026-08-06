@@ -80,6 +80,31 @@
  * page" from the outside). See parseArcIndexWikitext's own comment for the
  * full explanation.
  *
+ * FIX (2026-08, later same day): the fixes above only ever addressed HOW an
+ * arc/season page gets found — they didn't address what happens when the
+ * page IS found but none of SEASON_EPISODE_SECTION_NAMES/
+ * SEASON_CHARACTER_SECTION_NAMES matches any of its headings (e.g. a typo).
+ * On Lookism specifically, arc 1's own page —
+ * https://lookism.fandom.com/wiki/Exposition — spells its synopsis heading
+ * "Sypnosis" (confirmed live; other arc pages spell it correctly), so
+ * findArcPageEpisodes fell through to its whole-page "grab every
+ * episode-shaped link" fallback tier. That fallback also picks up the
+ * page's own "Episode Navigation" footer table, which — confirmed live —
+ * lists every episode of every arc in the whole series, not just this one.
+ * So "arc 1" came back with the whole series: not because the arc failed to
+ * resolve, and not because episodeCategoryArcScoped was ever false (the
+ * whole-page tier is marked arc-scoped the same as the section tier — see
+ * the handler), but because the fallback tier itself had no defense against
+ * a wiki-wide nav footer. Two changes: (1) 'Sypnosis' added to
+ * SEASON_EPISODE_SECTION_NAMES so arc 1 hits the precise section tier
+ * again, same as every other arc; (2) FOOTER_SECTION_NAMES/
+ * fetchAllPageLinksExcludingFooters added so the whole-page fallback tier
+ * (both here and in findSeasonPageCharacters) can never mistake a
+ * Navigation/References/etc. footer section for this arc/season's own
+ * content, on this wiki or any other — belt-and-suspenders for whichever of
+ * Lookism's ~75 OTHER arc pages might have their own heading quirks that
+ * haven't been hit yet.
+ *
  * ARC SCOPING — EPISODES: when `arc` is passed, episode category guessing
  * tries arc-scoped category names first (e.g. "Charmed Season 1 Episodes",
  * "Season 1 Episodes", and — FIX (2026-08) — the "/" subcategory form some
@@ -899,6 +924,68 @@ async function fetchAllPageLinks(subdomain, title) {
     .filter(Boolean);
 }
 
+// Section-heading patterns that mean "wiki housekeeping / footer navigation,
+// not this page's own content" — used to keep the whole-page-link fallback
+// tiers (findSeasonPageCharacters' tier 2, findArcPageEpisodes' whole-page
+// tier) from treating a footer navbox as if it were this arc/season's own
+// cast or episode list.
+//
+// CONFIRMED live on Lookism: every arc page checked —
+// https://lookism.fandom.com/wiki/Exposition among them — ends with a
+// "Navigation" section containing a single "Episode Navigation" table that
+// lists EVERY episode of EVERY arc in the whole series (the current arc's
+// own row is merely bolded, not the only row present). fetchAllPageLinks
+// reads links off the PARSED page with no section boundary at all, so
+// without this exclusion, any time the whole-page fallback tier fires on a
+// wiki shaped like this — which happens whenever no heading in
+// SEASON_EPISODE_SECTION_NAMES/SEASON_CHARACTER_SECTION_NAMES matches, e.g.
+// via the very "Sypnosis" typo fixed just above — it would silently return
+// literally the entire series instead of the one arc that was asked for.
+// looksLikeEpisodeTitle can't catch this on its own: every link in that
+// navbox is, correctly, shaped exactly like "Episode 482" — it's not the
+// wrong SHAPE, it's the wrong SCOPE, which only a page-structure check like
+// this one can catch.
+const FOOTER_SECTION_NAMES = ['navigation', 'nav', 'references', 'notes', 'trivia', 'see also', 'external links', 'gallery'];
+
+function isFooterSectionLine(line) {
+  const lower = (line || '').trim().toLowerCase();
+  return FOOTER_SECTION_NAMES.some((name) => lower === name || lower.startsWith(`${name} `) || lower.startsWith(`${name}:`));
+}
+
+// Same idea as fetchAllPageLinks, but drops anything that ONLY appears
+// inside a footer/navigation-shaped section (see FOOTER_SECTION_NAMES just
+// above). Takes the page's already-fetched `sections` list (both callers
+// already have it on hand) so this costs at most one extra API call — to
+// fetch the footer section's own links — and zero extra calls on a page
+// with no such section.
+//
+// Deliberately a SUBTRACTION (whole-page links minus footer-section links)
+// rather than "union of every non-footer section," which would cost one API
+// call per remaining section instead of one call total: a title that's ALSO
+// linked somewhere outside the footer — the normal case for a real
+// cast/episode link, which is usually linked from the page's own prose or
+// infobox too, not just the nav table — survives the subtraction either
+// way. The one case this doesn't help is a title that's ONLY EVER linked
+// from inside the footer nav and nowhere else on the page — but silently
+// dropping that title (worst case: this guess comes back empty and the
+// caller moves on to the next one) is the correct failure mode here, not
+// silently keeping it: "only reachable via the wiki-wide nav footer" is
+// exactly the signal that a link is NOT scoped to this one arc/season.
+async function fetchAllPageLinksExcludingFooters(subdomain, title, sections, warnings) {
+  const allLinks = await fetchAllPageLinks(subdomain, title);
+  const footerSections = (sections || []).filter((s) => isFooterSectionLine(s.line));
+  if (!footerSections.length) return allLinks;
+  const footerLinks = new Set();
+  for (const s of footerSections) {
+    try {
+      for (const link of await fetchSectionLinks(subdomain, title, s.index)) footerLinks.add(link);
+    } catch (err) {
+      warnings.push(`Couldn't read the "${s.line}" section on "${title}" to exclude it from the whole-page fallback (leaving it un-excluded this round): ${err.message}`);
+    }
+  }
+  return allLinks.filter((link) => !footerLinks.has(link));
+}
+
 // A season page's Cast/Characters section can carry a small number of
 // wikilinks that aren't character pages even though they sit right next to
 // ones that are — most commonly a self-link back to the season page itself
@@ -976,10 +1063,10 @@ async function findSeasonPageCharacters(subdomain, pageGuesses, warnings) {
     // their season page the way tier 1 expects — it's noisier, but still a
     // real read of THIS season's page, not the wiki-wide fallback below.
     try {
-      const allLinks = await fetchAllPageLinks(subdomain, pageTitle);
+      const allLinks = await fetchAllPageLinksExcludingFooters(subdomain, pageTitle, sections, warnings);
       const titles = [...new Set(allLinks)].filter((t) => !looksLikeNonCharacterTitle(t, pageTitle));
       if (titles.length) {
-        warnings.push(`Season page "${pageTitle}" had no usable Cast/Characters section — used every link on the page instead (filtered for obvious non-character titles), so double-check the result for stragglers.`);
+        warnings.push(`Season page "${pageTitle}" had no usable Cast/Characters section — used every link on the page instead (excluding its Navigation/footer section, if any, and filtered for obvious non-character titles), so double-check the result for stragglers.`);
         return { pageTitle, titles, tier: 'whole-page' };
       }
     } catch (err) {
@@ -1005,7 +1092,24 @@ async function findSeasonPageCharacters(subdomain, pageGuesses, warnings) {
 // alphabetical order:" list linking each chapter's own page. On a wiki like
 // that, buildEpisodeCategoryGuesses can never find anything arc-scoped,
 // because no such category exists there AT ALL — only this per-arc page does.
-const SEASON_EPISODE_SECTION_NAMES = ['Synopsis', 'Episodes', 'Chapters', 'Episode List', 'Chapter List', 'Plot'];
+// FIX (2026-08): 'Sypnosis' (sic) added after fetching Lookism's OWN arc-1
+// page live — https://lookism.fandom.com/wiki/Exposition, the exact page
+// this file's arc-1 example refers to — and confirming its synopsis heading
+// is literally spelled "Sypnosis", not "Synopsis". Breakaway (arc 2) and the
+// earlier-confirmed Cheonliang_Arc both spell it correctly, so this is a
+// page-specific typo, not a wiki-wide rename — but it's on the arc-1 page
+// specifically, which is exactly why "arc 1" was the one that kept coming
+// back wrong: findSectionIndex found no match for "Synopsis" on THIS ONE
+// PAGE, so findArcPageEpisodes silently fell through to its whole-page
+// fallback tier — which, on this wiki, means picking up the page's own
+// "Episode Navigation" footer table, a navbox listing literally every
+// episode of every arc in the whole series (confirmed live: the Exposition
+// page's Navigation section lists episodes 1 through 198+ across dozens of
+// arcs, not just its own 1-10). See FOOTER_SECTION_NAMES below for the fix
+// to that fallback tier itself, which stops this from silently recurring on
+// any of Lookism's other ~75 arc pages that might have their own heading
+// quirks.
+const SEASON_EPISODE_SECTION_NAMES = ['Synopsis', 'Sypnosis', 'Episodes', 'Chapters', 'Episode List', 'Chapter List', 'Plot'];
 
 // Is `title` SHAPED like an episode/chapter page for this media type — e.g.
 // "Episode 482", "Chapter 12"? Used as an ALLOW-list by findArcPageEpisodes
@@ -1089,10 +1193,10 @@ async function findArcPageEpisodes(subdomain, pageGuesses, media, warnings) {
     // allow-list means it can only ever pick up things that actually look
     // like "Episode N"/"Chapter N" regardless of where on the page they sit.
     try {
-      const allLinks = await fetchAllPageLinks(subdomain, pageTitle);
+      const allLinks = await fetchAllPageLinksExcludingFooters(subdomain, pageTitle, sections, warnings);
       const titles = [...new Set(allLinks)].filter((t) => t !== pageTitle && looksLikeEpisodeTitle(t, media));
       if (titles.length) {
-        warnings.push(`Arc page "${pageTitle}" had no usable Synopsis/Episodes section — used every episode-shaped link on the page instead.`);
+        warnings.push(`Arc page "${pageTitle}" had no usable Synopsis/Episodes section — used every episode-shaped link on the page instead (excluding its Navigation/footer section, if any — see FOOTER_SECTION_NAMES).`);
         return { pageTitle, titles, tier: 'whole-page' };
       }
     } catch (err) {
