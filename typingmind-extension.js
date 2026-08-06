@@ -21,15 +21,34 @@
  *      exists).
  *   4. Calls YOUR OWN lore API (see LORE_API_BASE below — a Vercel
  *      function backed by Supabase, api/lore.js in this same delivery)
- *      to get the full episode Plot text + character bio/powers/
- *      relationships/trivia bullets for that fandom+arc. The API does
+ *      to get the full episode Plot text + character personality/
+ *      history/powers/trivia bullets for that fandom+arc. The API does
  *      the actual Fandom fetching and permanent storage; this script
  *      never talks to Fandom directly anymore.
  *   5. Continuously rescans the chat's own messages for character/
- *      episode mentions, and writes ONLY the matching lore into that
- *      chat's chatParams.systemMessage — so the bot gets the exact
- *      canon it needs as the conversation moves, not everything at
- *      once and not a size-capped chunk of it.
+ *      episode mentions, and writes matching lore into that chat's
+ *      chatParams.systemMessage — so the bot gets the canon it needs
+ *      as the conversation moves, not everything at once. Matches are
+ *      split into two tiers (see classifyMatches): anyone matched in
+ *      the last ACTIVE_SCAN_MESSAGES messages gets a full profile;
+ *      anyone matched only further back (within the wider
+ *      CHAT_TEXT_SCAN_MESSAGES window) — i.e. mentioned in passing,
+ *      not currently active — gets a single-line stub instead. This is
+ *      a recency heuristic, not real scene tracking: it can't tell
+ *      "present in the scene" from "name-dropped in the latest
+ *      message," but it fixes stale mentions from many turns back
+ *      staying tagged as full matches. Each profile is also capped —
+ *      personality/history to MAX_BULLETS_PER_CATEGORY bullets, every
+ *      bullet (including uncapped-count powers/trivia) truncated to
+ *      MAX_BULLET_CHARS, episode plots to MAX_PLOT_CHARS — and this
+ *      happens once, when the corpus is indexed (buildEntityIndex), so
+ *      it bounds what the extension keeps for EVERY character, not just
+ *      the ones that end up matching a chat. Separately, the whole
+ *      injected block enforces a hard ceiling (MAX_INJECTION_CHARS),
+ *      checked on every rescan against whatever's currently matched —
+ *      dropping stubs then whole profiles from the end of the match
+ *      order before it would ever ship a giant wiki-sized dump — never
+ *      a mid-block truncation.
  *
  * DEBUGGING:
  * After any fetch (successful or not), the exact text that was/would be
@@ -90,7 +109,32 @@
   const RECHECK_INTERVAL_MS = 3000; // how often to poll while waiting for chat/agent data (or the next fetch batch)
   const RECHECK_DURATION_MS = 30000; // how long to keep polling for chat/agent data before giving up
   const ENTITY_RESCAN_MS = 5000; // once lore is loaded, how often to re-scan the chat for mentions and refresh the injection
-  const CHAT_TEXT_SCAN_MESSAGES = 40; // how many of the most recent messages to scan for character/episode mentions
+  const CHAT_TEXT_SCAN_MESSAGES = 40; // outer window: anyone mentioned anywhere in this many recent messages is eligible for a lore entry
+  // Inner window: only entities matched within this many MOST RECENT messages
+  // get the full profile block. Anyone matched only in the outer band above
+  // (i.e. mentioned earlier but not in these last few messages) is treated as
+  // "brought up, not on-screen" and gets a one-line stub instead — see
+  // classifyMatches/composeInjection. This can't perfectly detect "in the
+  // scene" (a character can be name-dropped in the very last message without
+  // being present), but it fixes the common case of a passing mention 20+
+  // turns back staying tagged as a full match for the rest of the window.
+  const ACTIVE_SCAN_MESSAGES = 4;
+  // Per-profile size caps. These are COPY-time caps, not injection-time:
+  // they're applied once, when the corpus is indexed (see buildEntityIndex),
+  // to every character in the corpus — so a bullet beyond the cap is simply
+  // never kept in the entity index at all, regardless of whether that
+  // character ends up matching a chat later. This is a different kind of
+  // limit from MAX_INJECTION_CHARS below, which is a per-injection ceiling
+  // re-checked on every rescan against only whatever's currently matched.
+  const MAX_BULLETS_PER_CATEGORY = 4; // personality/history only — long prose sections worth summarizing down
+  const MAX_BULLET_CHARS = 220; // safety net: truncate any single bullet longer than this, all categories
+  const MAX_PLOT_CHARS = 900; // truncate an episode's plot text in the full block
+  // Hard ceiling on the whole injected block, checked in composeInjection
+  // AFTER the per-category caps above. If still over budget, stub lines are
+  // dropped first (cheapest to lose), then whole full-profile blocks from
+  // the end of the match order — never a mid-block truncation, since a
+  // half-cut bullet list reads as broken but a dropped character doesn't.
+  const MAX_INJECTION_CHARS = 6000;
   const MARKER_PREFIX = '<!-- lorefetch:'; // marks our injected block so we can find/replace it
   // Backstop against an infinite fetch loop: if the server keeps returning
   // done:false round after round (e.g. because the same page fails every
@@ -414,26 +458,63 @@
   // Turns the corpus into one lookup-able block per episode/character, then
   // matches those against whatever's actually been said in the chat, so we
   // only ever inject lore that's relevant right now.
+  function truncateText(s, maxChars) {
+    if (!s) return s;
+    return s.length > maxChars ? `${s.slice(0, maxChars).trim()}\u2026` : s;
+  }
+
+  function capBullets(list, max) {
+    return (list || []).slice(0, max).map((b) => truncateText(b, MAX_BULLET_CHARS));
+  }
+
+  // Same per-bullet MAX_BULLET_CHARS safety truncation as capBullets, but no
+  // count limit — for categories that are naturally short (powers, trivia)
+  // and don't need summarizing down the way personality/history do.
+  function truncateBullets(list) {
+    return (list || []).map((b) => truncateText(b, MAX_BULLET_CHARS));
+  }
+
   function buildEntityIndex(corpus) {
     const entities = [];
     for (const ep of corpus.episodes || []) {
       if (!ep.plot) continue;
-      entities.push({ type: 'episode', names: [ep.title], block: `### ${ep.title}\n${ep.plot}` });
+      const plot = truncateText(ep.plot, MAX_PLOT_CHARS);
+      entities.push({
+        type: 'episode',
+        names: [ep.title],
+        block: `### ${ep.title}\n${plot}`,
+        // Shown instead of the full block when this episode is only matched
+        // in the outer "mentioned" window, not the recent "active" one.
+        stub: `- **${ep.title}**: ${truncateText(ep.plot, 140)}`,
+      });
     }
     for (const ch of corpus.characters || []) {
       const parts = [];
-      if (ch.personality && ch.personality.length) parts.push(`**Personality**\n${ch.personality.map((b) => `- ${b}`).join('\n')}`);
-      if (ch.history && ch.history.length) parts.push(`**History**\n${ch.history.map((b) => `- ${b}`).join('\n')}`);
-      if (ch.powers && ch.powers.length) parts.push(`**Powers/Abilities**\n${ch.powers.map((b) => `- ${b}`).join('\n')}`);
-      if (ch.relationships && ch.relationships.length) parts.push(`**Relationships**\n${ch.relationships.map((b) => `- ${b}`).join('\n')}`);
-      if (ch.trivia && ch.trivia.length) parts.push(`**Trivia**\n${ch.trivia.map((b) => `- ${b}`).join('\n')}`);
+      const personality = capBullets(ch.personality, MAX_BULLETS_PER_CATEGORY);
+      const history = capBullets(ch.history, MAX_BULLETS_PER_CATEGORY);
+      const powers = truncateBullets(ch.powers);
+      const trivia = truncateBullets(ch.trivia);
+      if (personality.length) parts.push(`**Personality**\n${personality.map((b) => `- ${b}`).join('\n')}`);
+      if (history.length) parts.push(`**History**\n${history.map((b) => `- ${b}`).join('\n')}`);
+      if (powers.length) parts.push(`**Powers/Abilities**\n${powers.map((b) => `- ${b}`).join('\n')}`);
+      if (trivia.length) parts.push(`**Trivia**\n${trivia.map((b) => `- ${b}`).join('\n')}`);
       if (!parts.length) continue;
       // A character's own page title is usually their full name ("Piper
       // Halliwell"); add the bare first word too (mostly first name) so a
       // chat that just says "Piper" still matches.
       const firstWord = ch.name.split(' ')[0];
       const names = firstWord && firstWord !== ch.name ? [ch.name, firstWord] : [ch.name];
-      entities.push({ type: 'character', names, block: `### ${ch.name}\n${parts.join('\n')}` });
+      // Stub for the "mentioned, not active" tier: whatever the single most
+      // identity-defining line available is, so a passing reference to this
+      // character still reminds the model who they are without paying for
+      // the whole profile.
+      const stubLine = personality[0] || history[0] || powers[0] || 'no summary available';
+      entities.push({
+        type: 'character',
+        names,
+        block: `### ${ch.name}\n${parts.join('\n')}`,
+        stub: `- **${ch.name}**: ${stubLine}`,
+      });
     }
     return entities;
   }
@@ -447,12 +528,58 @@
     return entityIndex.filter((entity) => entity.names.some((name) => name && hay.includes(` ${normalize(name)} `)));
   }
 
-  function composeInjection(matched, wiki, arc) {
-    if (!matched.length) return '';
-    let text = `Canon reference: ${wiki.sitename}\nSource: ${wiki.url}\n`;
-    if (arc) text += `Scoped to: ${arc}\n`;
-    text += `\n${matched.map((e) => e.block).join('\n\n')}`;
-    return text.trim();
+  function entityKey(e) {
+    return `${e.type}:${e.names[0]}`;
+  }
+
+  // Splits whatever matched in the full CHAT_TEXT_SCAN_MESSAGES window into
+  // two tiers: `active` (also matched within the smaller, most-recent
+  // ACTIVE_SCAN_MESSAGES window — gets the full profile) and `mentionedOnly`
+  // (matched further back but not recently — gets a one-line stub instead).
+  // This is a recency heuristic, not real scene understanding: a character
+  // named once in the very latest message still counts as "active" even if
+  // they're being talked ABOUT rather than being present. What it does fix
+  // is the more common case — a name-drop from many turns ago staying tagged
+  // as a full match for the rest of the 40-message window.
+  function classifyMatches(entityIndex, allText, activeText) {
+    const all = matchEntities(entityIndex, allText);
+    const activeKeys = new Set(matchEntities(entityIndex, activeText).map(entityKey));
+    const active = all.filter((e) => activeKeys.has(entityKey(e)));
+    const mentionedOnly = all.filter((e) => !activeKeys.has(entityKey(e)));
+    return { active, mentionedOnly };
+  }
+
+  // Assembles the injected text from already-capped blocks/stubs, then
+  // enforces MAX_INJECTION_CHARS by dropping whole pieces — stub lines first
+  // (cheapest to lose), then full-profile blocks from the end of the match
+  // order — rather than ever truncating inside a block.
+  function composeInjection(active, mentionedOnly, wiki, arc) {
+    if (!active.length && !mentionedOnly.length) return '';
+    let header = `Canon reference: ${wiki.sitename}\nSource: ${wiki.url}\n`;
+    if (arc) header += `Scoped to: ${arc}\n`;
+
+    const activeBlocks = active.map((e) => e.block);
+    const stubLines = mentionedOnly.map((e) => e.stub);
+
+    const assemble = () => {
+      let text = header;
+      if (activeBlocks.length) text += `\n${activeBlocks.join('\n\n')}`;
+      if (stubLines.length) {
+        text += `\n\n**Also mentioned recently** (not currently active in the scene \u2014 brief reference only):\n${stubLines.join('\n')}`;
+      }
+      return text.trim();
+    };
+
+    let text = assemble();
+    while (text.length > MAX_INJECTION_CHARS && stubLines.length) {
+      stubLines.pop();
+      text = assemble();
+    }
+    while (text.length > MAX_INJECTION_CHARS && activeBlocks.length > 1) {
+      activeBlocks.pop();
+      text = assemble();
+    }
+    return text;
   }
 
   // ASSUMPTION, unverified: a chat's turns live at `chat.messages`, an array
@@ -471,9 +598,9 @@
     return '';
   }
 
-  function extractRecentChatText(chat, limit) {
+  function extractRecentChatTexts(chat, limit) {
     const messages = Array.isArray(chat.messages) ? chat.messages : [];
-    return messages.slice(-limit).map(extractMessageText).join('\n');
+    return messages.slice(-limit).map(extractMessageText);
   }
 
   window.LoreFetchInspectMessages = async function (chatId) {
@@ -944,13 +1071,17 @@
     const chatEntry = await resolveStorageKey(state.chatKey);
     if (!chatEntry) return;
     const chat = chatEntry.value;
-    const chatText = extractRecentChatText(chat, CHAT_TEXT_SCAN_MESSAGES);
-    const matched = matchEntities(state.entityIndex, chatText);
-    const matchedKey = matched.map((m) => `${m.type}:${m.names[0]}`).sort().join('|');
+    const allTexts = extractRecentChatTexts(chat, CHAT_TEXT_SCAN_MESSAGES);
+    const activeTexts = allTexts.slice(-ACTIVE_SCAN_MESSAGES);
+    const { active, mentionedOnly } = classifyMatches(state.entityIndex, allTexts.join('\n'), activeTexts.join('\n'));
+    const matchedKey = [
+      ...active.map((m) => `A:${entityKey(m)}`),
+      ...mentionedOnly.map((m) => `M:${entityKey(m)}`),
+    ].sort().join('|');
     if (matchedKey === state.lastMatchedKey) return;
 
     const marker = `${MARKER_PREFIX}${state.agentId}:${state.parsed.fandom}:${state.parsed.arc || ''} -->`;
-    const injected = composeInjection(matched, state.corpus.wiki, state.parsed.arc);
+    const injected = composeInjection(active, mentionedOnly, state.corpus.wiki, state.parsed.arc);
     const text = injected ? `${marker}\n${injected}` : `${marker}\n(No characters or episodes from this fandom have come up in the chat yet.)`;
     window.LoreFetchLastContext = text;
 
@@ -961,16 +1092,25 @@
     await kvPut(chatEntry.key, chat);
     state.lastMatchedKey = matchedKey;
 
-    debugLog(`rescan: ${matched.length}/${state.entityIndex.length} entities matched ->`, matched.map((m) => m.names[0]));
-    console.log(`%c[LoreFetch] Injected ${matched.length} matching entit${matched.length === 1 ? 'y' : 'ies'}.`, 'color:#45f0a0;font-weight:bold');
+    debugLog(
+      `rescan: ${active.length} active + ${mentionedOnly.length} mentioned-only / ${state.entityIndex.length} total ->`,
+      'active:', active.map((m) => m.names[0]),
+      '| mentioned-only:', mentionedOnly.map((m) => m.names[0])
+    );
+    console.log(
+      `%c[LoreFetch] Injected ${active.length} full profile${active.length === 1 ? '' : 's'} + ${mentionedOnly.length} stub${mentionedOnly.length === 1 ? '' : 's'} (${text.length} chars).`,
+      'color:#45f0a0;font-weight:bold'
+    );
 
     // Always show the episode/character split, not just a combined count —
     // "0 entities" was never distinguishable from "0 episodes, 3 characters"
     // at a glance before, which is exactly how a missing-episodes bug hid
-    // behind a green badge.
+    // behind a green badge. Char count is here too now, since "it's injecting
+    // way too much text" was previously only visible by manually measuring
+    // window.LoreFetchLastContext.
     const episodeCount = (state.corpus.episodes || []).length;
     const characterCount = (state.corpus.characters || []).length;
-    const counts = `${episodeCount} episode${episodeCount === 1 ? '' : 's'}, ${characterCount} character${characterCount === 1 ? '' : 's'} loaded \u2014 ${matched.length} currently in context`;
+    const counts = `${episodeCount} episode${episodeCount === 1 ? '' : 's'}, ${characterCount} character${characterCount === 1 ? '' : 's'} loaded \u2014 ${active.length} active, ${mentionedOnly.length} mentioned-only \u2014 ${text.length} chars in context`;
 
     if (state.status === 'partial') {
       setBadgeState(
