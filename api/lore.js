@@ -280,15 +280,6 @@ const CHARACTER_SECTION_GROUPS = {
   personality: ['Personality', 'Personality and Traits', 'Personality Traits'],
   history: ['History', 'Biography', 'Background'],
   powers: ['Powers and Abilities', 'Powers', 'Abilities'],
-  // 'Relationships' alone missed most Charmed characters — confirmed via
-  // charmed.fandom.com's own section list that the actual heading there is
-  // "Romantic Life", not "Relationships". Keeping 'Relationships' too since
-  // other wikis in this same pipeline do use that literal heading; 'Love
-  // Interests' added as a third common Fandom convention (seen used as a
-  // category name on charmed.fandom.com itself: "Category:Piper's Love
-  // Interest"), unconfirmed as a HEADING on any wiki so far — remove if it
-  // ever causes a false match.
-  relationships: ['Relationships', 'Romantic Life', 'Love Interests'],
   trivia: ['Trivia', 'Notes and Trivia', 'Notes'],
 };
 
@@ -301,12 +292,11 @@ const CHARACTER_SECTION_GROUPS = {
 // FIRST (see fetchCharacterBullets) for any key listed here, since a
 // dedicated subpage is a more deliberate, complete source than a same-page
 // heading would be; falls through to the same-page CHARACTER_SECTION_GROUPS
-// heading search if no subpage exists under any suffix. Only 'relationships'
-// has a confirmed subpage convention so far — add more keys here if another
-// field turns out to work the same way on some other wiki.
-const CHARACTER_SUBPAGE_SUFFIXES = {
-  relationships: ['Relationships'],
-};
+// heading search if no subpage exists under any suffix. Nothing currently
+// in CHARACTER_SECTION_GROUPS uses this tier (relationships did, until that
+// field was dropped) — left in place and empty so a future field can opt in
+// without re-deriving this mechanism.
+const CHARACTER_SUBPAGE_SUFFIXES = {};
 
 // Section names tried (in order — see findSectionIndex) on a SEASON page
 // itself (not a character page) to find its cast listing. "Cast and
@@ -1769,8 +1759,8 @@ export default async function handler(req, res) {
     // section that turns out NOT to be an actual character page (an actor's
     // own bio page linked from that section, say — see the comment on
     // looksLikeNonCharacterTitle for why that check can't catch this case up
-    // front) will fetch successfully but come back with none of History/
-    // Powers/Relationships/Trivia, exactly like a genuinely-failed fetch
+    // front) will fetch successfully but come back with none of Personality/
+    // History/Powers/Trivia, exactly like a genuinely-failed fetch
     // does. Dropping it here means a stray non-character link never
     // silently rides along in the corpus as a nameplate with no content.
     const emptyBulletTitles = [];
@@ -1783,7 +1773,6 @@ export default async function handler(req, res) {
           personality: row.personality || [],
           history: row.history || [],
           powers: row.powers || [],
-          relationships: row.relationships || [],
           trivia: row.trivia || [],
         });
       } else {
