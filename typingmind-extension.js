@@ -553,8 +553,17 @@
   // enforces MAX_INJECTION_CHARS by dropping whole pieces — stub lines first
   // (cheapest to lose), then full-profile blocks from the end of the match
   // order — rather than ever truncating inside a block.
+  //
+  // The header (fandom + arc) is now ALWAYS included, even with zero
+  // matches — previously this returned '' until something was actually
+  // named in the chat, which meant the injected block carried no fandom/
+  // season identification at all for however long a fresh chat went before
+  // anyone got mentioned. Since chat.chatParams.systemMessage is written
+  // unconditionally from the very first rescan onward (see rescanAndInject),
+  // that gap meant the model's grounding in what it's portraying depended
+  // entirely on TypingMind's own handling of the agent's `instruction` field
+  // for that window. Always emitting the header removes that dependency.
   function composeInjection(active, mentionedOnly, wiki, arc) {
-    if (!active.length && !mentionedOnly.length) return '';
     let header = `Canon reference: ${wiki.sitename}\nSource: ${wiki.url}\n`;
     if (arc) header += `Scoped to: ${arc}\n`;
 
@@ -566,6 +575,9 @@
       if (activeBlocks.length) text += `\n${activeBlocks.join('\n\n')}`;
       if (stubLines.length) {
         text += `\n\n**Also mentioned recently** (not currently active in the scene \u2014 brief reference only):\n${stubLines.join('\n')}`;
+      }
+      if (!activeBlocks.length && !stubLines.length) {
+        text += '\n(No characters or episodes from this fandom have come up in the chat yet.)';
       }
       return text.trim();
     };
@@ -1082,7 +1094,7 @@
 
     const marker = `${MARKER_PREFIX}${state.agentId}:${state.parsed.fandom}:${state.parsed.arc || ''} -->`;
     const injected = composeInjection(active, mentionedOnly, state.corpus.wiki, state.parsed.arc);
-    const text = injected ? `${marker}\n${injected}` : `${marker}\n(No characters or episodes from this fandom have come up in the chat yet.)`;
+    const text = `${marker}\n${injected}`;
     window.LoreFetchLastContext = text;
 
     const existing = (chat.chatParams && chat.chatParams.systemMessage) || '';
