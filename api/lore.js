@@ -337,6 +337,29 @@ const SEASON_CHARACTER_SECTION_NAMES = ['Cast and Characters', 'Characters', 'Ca
 // "Holly Marie Combs") are filed under "Category:Performers".
 const NON_CHARACTER_CATEGORY_PATTERN = /\b(performers?|actors?|actresses?|real[\s-]?world|crew|cast\s*(?:and|&)?\s*crew|behind[\s-]?the[\s-]?scenes|production\s*(?:staff|team)?|directors?|writers?|producers?|creators?)\b/i;
 
+// The mirror-image check of NON_CHARACTER_CATEGORY_PATTERN above, used by
+// findArcPageEpisodes as a guard against exactly the failure that pattern
+// doesn't cover: an arc named after a character (Lookism's "Zack Lee",
+// "Vasco", ...) can collide with that CHARACTER's own bare-titled page on
+// wikis where the arc itself is only disambiguated with an "Arc" suffix
+// ("Zack Lee Arc", "Vasco Arc" — confirmed live on lookism.fandom.com,
+// Category:Story Arcs). buildSeasonPageGuesses now tries the suffixed forms
+// before the bare one specifically to avoid landing on the bare page first,
+// but that's a guess-ORDER fix — it doesn't help on a wiki where the
+// character collision exists but no disambiguated arc page does. This is
+// the backstop for that: if a guessed page's own categories say
+// "Characters" (an in-universe cast page, not a real-world one — that's
+// NON_CHARACTER_CATEGORY_PATTERN's job above), findArcPageEpisodes treats it
+// as the wrong page and moves on instead of harvesting whatever
+// episode-shaped links happen to be scattered across that character's own
+// history/appearances — which, for any character who recurs across many
+// arcs, is not this arc's episode list at all. Same allow-by-exclusion
+// philosophy as NON_CHARACTER_CATEGORY_PATTERN and looksLikeNonCharacterTitle:
+// this only ever excludes a page it can positively identify as a character
+// page via its own Fandom categorization, and a failed/empty categories
+// lookup passes through unchanged rather than blocking anything.
+const CHARACTER_PAGE_CATEGORY_PATTERN = /\bcharacters?\b/i;
+
 // MediaWiki's prop=categories accepts multiple pipe-separated titles per
 // request, capped at 50 for anonymous/non-bot callers (500 needs
 // apihighlimits, which this script's plain fetch() calls don't have) — see
@@ -633,19 +656,37 @@ function buildSeasonPageGuesses(fandom, year, arc) {
   // findSeasonPageCharacters/findArcPageEpisodes never found that wiki's
   // season page and always fell through to a wiki-wide fallback).
   guesses.push(`${fandom}/${arc}`);
-  guesses.push(arc);
-  // Confirmed on Lookism's own Category:Story_Arcs: arc page titles are NOT
-  // consistently bare — "Breakaway" and "Cult" sit right alongside
-  // disambiguated titles like "Cheonliang Arc" and "James Lee (Arc)" (needed
-  // because "James Lee" and "Daniel Park" are ALSO character page titles on
-  // the same wiki). resolveArcTitleFromIndex normally sidesteps this by
-  // reading the real page title straight off the guide's own wikilink TARGET
-  // (see parseArcIndexWikitext) — but an entry with no link at all yet (a
-  // recent, not-yet-wikified arc) falls back to plain display text, which
-  // won't include a suffix it doesn't display. Trying both suffixed forms
-  // here, after the bare guess, is a cheap fallback for exactly that case.
+  // FIX (2026-08): these disambiguated forms USED to be tried after the bare
+  // `arc` guess below, on the theory that resolveArcTitleFromIndex would
+  // already have resolved `arc` to the disambiguated title itself whenever
+  // one was needed (by reading the Arc Guide entry's wikilink TARGET — see
+  // parseArcIndexWikitext) — leaving the suffixed guesses here as a "cheap
+  // fallback" only for a not-yet-wikified guide entry with no link at all.
+  // CONFIRMED WRONG on Lookism, the wiki this whole arc-resolution feature
+  // was built around: its own Arc Guide entries for arcs 1-10 (Exposition,
+  // Breakaway, Zack Lee, Vasco, ...) are plain, un-wikilinked list text, not
+  // [[links]] — so parseArcIndexWikitext falls back to the bare display text
+  // every time for these, exactly the "no link yet" case, and NOT some rare
+  // edge case. For any arc named after a character — confirmed live for
+  // BOTH "Zack Lee" and "Vasco" — Lookism's wiki has a bare-titled page for
+  // the CHARACTER ("Zack Lee", "Vasco" — Category:Characters) sitting
+  // alongside a differently-titled page for the ARC itself ("Zack Lee Arc",
+  // "Vasco Arc" — Category:Story Arcs). With the bare guess tried first, the
+  // arc's own findArcPageEpisodes call above stopped at the character's
+  // page — an existing, real page, so the guess "succeeds" — read that
+  // character's own episode-shaped links (appearances scattered across
+  // however much of the whole series that character shows up in, which for
+  // a recurring character is most of it) as if they were THIS arc's episode
+  // list. That's exactly why a request scoped to early arcs like these could
+  // come back with episodes numbered in the hundreds: it silently swapped
+  // "this arc's chapters" for "every chapter this character has ever been
+  // in." Trying the suffixed, disambiguated forms FIRST costs nothing on a
+  // wiki where no collision exists (the guess just 404s and falls through to
+  // the bare one, same as before) and is what actually prevents landing on
+  // the wrong page on a wiki where one does.
   guesses.push(`${arc} Arc`);
   guesses.push(`${arc} (Arc)`);
+  guesses.push(arc);
   return [...new Set(guesses.filter(Boolean))];
 }
 
@@ -1009,6 +1050,23 @@ async function findArcPageEpisodes(subdomain, pageGuesses, media, warnings) {
       sections = await fetchPageSections(subdomain, pageTitle);
     } catch (err) {
       continue; // no page by this exact title on the wiki — try the next guess
+    }
+
+    // Guard against a same-titled CHARACTER page (see
+    // CHARACTER_PAGE_CATEGORY_PATTERN's own comment) winning this guess
+    // instead of the real arc page. A failed/empty lookup passes through
+    // unchanged — this can only ever skip a guess it positively identifies
+    // as a character page, never block one it isn't sure about.
+    try {
+      const cats = (await fetchCategoriesForTitles(subdomain, [pageTitle]))[pageTitle];
+      if (cats && cats.some((c) => CHARACTER_PAGE_CATEGORY_PATTERN.test(c))) {
+        warnings.push(`Arc page guess "${pageTitle}" is actually a character page (per its own Fandom categories) — skipped it and tried the next guess instead.`);
+        continue;
+      }
+    } catch (err) {
+      // Categories lookup itself failing is not a reason to give up on this
+      // guess — fall through and evaluate it normally, same resilience
+      // pattern as filterOutRealWorldPages.
     }
 
     if (sections.length) {
