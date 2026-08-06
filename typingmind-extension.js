@@ -11,9 +11,17 @@
  *      to a chat.
  *   2. Reads that chat's linked agent and its `instruction` text from
  *      TypingMind's IndexedDB (database "keyval-store", store "keyval").
- *   3. Parses out {arc, year, media, fandom} from instructions shaped
+ *   3. Parses out {arcs, year, media, fandom} from instructions shaped
  *      like: "Portray canon characters in season 5 of the 1998 show
- *      Charmed." Also scans those same instructions for any number of
+ *      Charmed." `arcs` is always an array — MULTIPLE arcs can be named in
+ *      one instruction, either as a number list in the arc clause itself
+ *      ("Portray canon characters in arcs 1, 2, 3, 5 and 7 of the Webtoon
+ *      Lookism.", "arcs 1-5, 7-8" also works) or by repeating the whole
+ *      sentence once per arc ("Portray canon characters in arc 1 of the
+ *      Webtoon Lookism. Portray canon characters in arc 2 of the Webtoon
+ *      Lookism. ...") — see parseSystemPrompt for why the latter needed a
+ *      fix to actually work (it used to silently only read the first
+ *      sentence). Also scans those same instructions for any number of
  *      standalone "Also fetch the character <Name>." / "Also fetch the
  *      episode <Title>." sentences, for pages that lore.js's automatic
  *      category discovery might not find on its own (see extraCharacters/
@@ -22,9 +30,15 @@
  *   4. Calls YOUR OWN lore API (see LORE_API_BASE below — a Vercel
  *      function backed by Supabase, api/lore.js in this same delivery)
  *      to get the full episode Plot text + character personality/
- *      history/powers/trivia bullets for that fandom+arc. The API does
- *      the actual Fandom fetching and permanent storage; this script
- *      never talks to Fandom directly anymore.
+ *      history/powers/trivia bullets for that fandom+arc. lore.js itself
+ *      only ever scopes one call to a single arc (see its own file
+ *      header), so when `arcs` has more than one entry,
+ *      fetchLoreCorpusForArcs calls it once per arc, sequentially, and
+ *      merges the results into one corpus — expect roughly N times the
+ *      wait for N arcs, since each arc's episodes/characters are fetched
+ *      from Fandom as if from scratch. The API does the actual Fandom
+ *      fetching and permanent storage; this script never talks to Fandom
+ *      directly anymore.
  *   5. Continuously rescans the chat's own messages for character/
  *      episode mentions, and writes matching lore into that chat's
  *      chatParams.systemMessage — so the bot gets the canon it needs
@@ -69,20 +83,24 @@
  * cached, so this (or manually clearing the relevant lore_categories /
  * lore_episodes rows) is required to actually pick up the fix.
  * Run `window.LoreFetchCheckMissing()` for a READ-ONLY check of what's
- * actually sitting in Supabase for the current chat's fandom/arc right now
- * — no Fandom fetches, no writes, so it can't show you a false positive the
- * way the badge theoretically could. Prints a per-title table to the
- * console (also on `window.LoreFetchLastCheck`) with each title marked ok /
- * stale / cached-empty / missing. If the badge claims N episodes loaded but
- * this says otherwise, the disagreement is happening below this script —
- * most likely the deployed lore.js is pointed at a different Supabase
- * project than whatever you're checking by hand, or a query against
- * lore_episodes is filtering on `arc` with different casing than what got
- * written (parseSystemPrompt below always title-cases it, e.g. "Season 5").
+ * actually sitting in Supabase for the current chat's fandom/arc(s) right
+ * now — no Fandom fetches, no writes, so it can't show you a false positive
+ * the way the badge theoretically could. Runs once PER requested arc (since
+ * lore.js only ever checks one arc per call) and prints a per-title table
+ * for each; the full set is on `window.LoreFetchLastCheck` as an array of
+ * `{ arc, result }`, one entry per arc (a single entry with `arc: null`
+ * when the instruction named no arc at all). If the badge claims N
+ * episodes loaded but this says otherwise, the disagreement is happening
+ * below this script — most likely the deployed lore.js is pointed at a
+ * different Supabase project than whatever you're checking by hand, or a
+ * query against lore_episodes is filtering on `arc` with different casing
+ * than what got written (parseSystemPrompt below always title-cases it,
+ * e.g. "Season 5").
  * A badge showing amber with "Lore — incomplete" (not the green "Lore
- * fetched") means an arc was requested but 0 episodes were resolved for
- * it — only character info made it into context. Click the badge (or
- * check window.LoreFetchLastWarnings) to see which category lookup failed.
+ * fetched") means at least one requested arc had 0 episodes resolved, or
+ * came back unscoped — check `partialReason` (also shown in the badge) for
+ * which arc(s) specifically. Click the badge (or check
+ * window.LoreFetchLastWarnings) to see which category lookup failed.
  *
  * IMPORTANT CAVEAT:
  * The systemMessage write is a raw write into TypingMind's own storage. If
@@ -281,23 +299,114 @@
   // The arc clause and year are optional and can be dropped; media and
   // fandom are always both present, in that order, right before the
   // trailing period. Media is always one of these five words.
+  //
+  // MULTIPLE ARCS: lore.js only ever scopes to ONE arc per /api/lore call
+  // (see its own file header) — there's no server-side concept of "give me
+  // several arcs at once." Two client-side things build on top of that
+  // single-arc primitive so an instruction can still name several:
+  //
+  //   1. The arc-number slot below accepts a NUMBER LIST, not just a single
+  //      digit: commas, "and", and hyphenated ranges all work — "arcs 1, 2,
+  //      3, 5 and 7", "arcs 1-5, 7-8", "arc 6" all parse correctly. See
+  //      parseNumberList.
+  //   2. parseSystemPrompt itself now scans the WHOLE instruction with a
+  //      global regex (matchAll-style, via the loop below) instead of
+  //      `.match()`-ing just the first sentence, and unions the arc numbers
+  //      found across every "Portray canon characters in ... ." sentence it
+  //      sees. That means the old habit of repeating the whole sentence
+  //      once per arc — "Portray canon characters in arc 1 of the Webtoon
+  //      Lookism. Portray canon characters in arc 2 of the Webtoon
+  //      Lookism. ..." — now works too, and can be freely mixed with the
+  //      list syntax above.
+  //
+  //   BEFORE THIS CHANGE: `.match()` without the `g` flag only ever returns
+  //   the leftmost match in the whole string, so every sentence after the
+  //   first one in a chained instruction was invisible to parseSystemPrompt
+  //   — its arc number, and everything else in it, was silently discarded.
+  //   That's why "arc 6" alone worked but 7 chained "arc N" sentences did
+  //   not: it's not that the request "crashed" — the extension only ever
+  //   read the FIRST sentence (arc 1) and, on top of that, one specific
+  //   Fandom quirk made even that single arc come back unscoped in
+  //   practice for some wikis (see episodeCategoryArcScoped downstream);
+  //   for a genuinely unscoped result the badge would have shown "partial"
+  //   rather than silently returning the whole series — worth checking if
+  //   this still happens after upgrading.
+  //
+  // `parsed.arcs` is always an array (possibly empty, meaning "no arc
+  // requested — whole series"). `parsed.arc` is kept around set to
+  // `arcs[0]` only when there's exactly one arc, purely so any code that
+  // still only cares about the single-arc case doesn't need to change.
   const MEDIA_TYPES = ['show', 'movie', 'game', 'comic', 'webtoon'];
+  const ARC_LABELS = ['season', 'arc', 'chapter', 'book', 'part', 'volume'];
 
-  const PROMPT_PATTERN = new RegExp(
-    `portray canon characters in\\s+(?:(season|arc|chapter|book|part|volume)\\s+(\\d+)\\s+of\\s+)?(?:the\\s+)?(?:(\\d{4})\\s+)?(${MEDIA_TYPES.join('|')})\\s+(.+?)\\.`,
-    'i'
-  );
+  // The arc-number capture here is deliberately permissive
+  // ([\d][\d,\s-]*?(?:and\s+\d+)?) — it just needs to grab everything
+  // between the label and "of" without eating "of" itself; parseNumberList
+  // below does the real parsing/validation, so a malformed list here just
+  // yields fewer numbers rather than a broken match.
+  const PROMPT_PATTERN_SOURCE = `portray canon characters in\\s+(?:(${ARC_LABELS.join(
+    '|'
+  )})s?\\s+([\\d][\\d,\\s-]*?(?:and\\s+\\d+)?)\\s+of\\s+)?(?:the\\s+)?(?:(\\d{4})\\s+)?(${MEDIA_TYPES.join('|')})\\s+(.+?)\\.`;
+
+  // Turns "1, 2, 3, 5 and 7" / "1-5, 7-8" / "6" into a deduped, sorted
+  // array of integers. Silently drops anything it can't parse (rather than
+  // erroring) since a stray typo in one clause shouldn't take down arc
+  // numbers that DID parse cleanly elsewhere in the same sentence.
+  function parseNumberList(raw) {
+    if (!raw) return [];
+    const nums = new Set();
+    for (const part of raw.replace(/\band\b/gi, ',').split(',')) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      const range = trimmed.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (range) {
+        let [a, b] = [parseInt(range[1], 10), parseInt(range[2], 10)];
+        if (a > b) [a, b] = [b, a];
+        for (let n = a; n <= b; n++) nums.add(n);
+      } else if (/^\d+$/.test(trimmed)) {
+        nums.add(parseInt(trimmed, 10));
+      }
+    }
+    return [...nums].sort((a, b) => a - b);
+  }
 
   function parseSystemPrompt(instruction) {
     if (!instruction) return null;
-    const m = instruction.match(PROMPT_PATTERN);
-    if (!m) return null;
-    const [, arcLabel, arcNumber, year, media, fandom] = m;
-    const arc = arcLabel ? `${arcLabel[0].toUpperCase()}${arcLabel.slice(1)} ${arcNumber}` : null;
-    const trimmedFandom = fandom.trim();
-    if (!trimmedFandom) return null;
+    const re = new RegExp(PROMPT_PATTERN_SOURCE, 'gi');
+    let fandom = null;
+    let media = null;
+    let year = null;
+    const arcSet = new Set(); // dedupe e.g. "Arc 2" named in more than one sentence
+    let matchedAny = false;
+    let m;
+    while ((m = re.exec(instruction))) {
+      matchedAny = true;
+      const [, arcLabel, arcNumbers, matchYear, matchMedia, matchFandom] = m;
+      // Media/fandom/year are taken from the FIRST sentence that has them;
+      // an instruction is expected to name one fandom throughout, so later
+      // sentences only ever contribute additional arc numbers.
+      if (fandom === null) {
+        fandom = matchFandom.trim();
+        media = matchMedia.toLowerCase();
+        year = matchYear || null;
+      }
+      if (arcLabel && arcNumbers) {
+        const label = `${arcLabel[0].toUpperCase()}${arcLabel.slice(1).toLowerCase()}`;
+        for (const n of parseNumberList(arcNumbers)) arcSet.add(`${label} ${n}`);
+      }
+    }
+    if (!matchedAny || !fandom) return null;
+    const arcs = [...arcSet];
     const { extraCharacters, extraEpisodes } = parseExtraEntries(instruction);
-    return { arc, year: year || null, media: media.toLowerCase(), fandom: trimmedFandom, extraCharacters, extraEpisodes };
+    return {
+      arcs,
+      arc: arcs.length === 1 ? arcs[0] : null,
+      year,
+      media,
+      fandom,
+      extraCharacters,
+      extraEpisodes,
+    };
   }
 
   // ================= Manual entry overrides =================
@@ -454,6 +563,94 @@
     }
   }
 
+  // lore.js has no concept of "several arcs in one call" — it scopes to
+  // exactly one `arc` string per POST (see its file header). This is the
+  // client-side answer to that: run the existing single-arc fetchLoreCorpus
+  // once per arc in `params.arcs` (sequentially, not in parallel, so we
+  // don't hammer Fandom with N concurrent batch loops at once), and merge
+  // the resulting episodes/characters/warnings into one corpus object.
+  // Everything downstream (buildEntityIndex, composeInjection, the badge)
+  // still only ever sees a single corpus shaped exactly like lore.js's own
+  // done:true response — it has no idea multiple requests happened.
+  //
+  // `params.arcs` may be an empty array (no arc clause at all — the whole
+  // series is requested) or have exactly one entry; both cases still route
+  // through this same loop rather than special-casing "just call
+  // fetchLoreCorpus directly," so there's only one code path to keep
+  // correct instead of two that need to stay in sync.
+  //
+  // Expect this to take roughly N times as long as a single-arc fetch for
+  // N arcs — lore.js's own batching/rate-limit delay against Fandom
+  // (REQUEST_DELAY_MS server-side) applies fully to each arc's episodes
+  // and characters, since from the server's point of view these are just
+  // N separate, unrelated /api/lore conversations.
+  async function fetchLoreCorpusForArcs(params, onProgress, isStale) {
+    const { arcs, ...rest } = params;
+    const arcList = arcs && arcs.length ? arcs : [null]; // null = no arc clause, whole series
+    const merged = {
+      wiki: null,
+      episodes: [],
+      characters: [],
+      warnings: [],
+      episodesRequested: 0,
+      charactersRequested: 0,
+      // Conservative AND across arcs: the merged corpus only counts as
+      // arc-scoped overall if EVERY requested arc individually came back
+      // arc-scoped. One unscoped arc mixed in with several scoped ones
+      // means the corpus as a whole can't be trusted the way a single
+      // cleanly-scoped arc could, so this can't just average out.
+      episodeCategoryArcScoped: true,
+      characterCategoryArcScoped: true,
+      // Per-arc detail — not read by any single-arc code path, but lets
+      // loadCorpusForChat build a "which specific arc(s) failed" message
+      // instead of one blanket warning covering all of them.
+      perArc: [],
+    };
+    const seenEpisodeTitles = new Set();
+    const seenCharacterNames = new Set();
+
+    for (let i = 0; i < arcList.length; i++) {
+      if (isStale && isStale()) throw cancelledError();
+      const arc = arcList[i];
+      const result = await fetchLoreCorpus(
+        { ...rest, arc },
+        (progress) => {
+          if (!onProgress) return;
+          onProgress({ ...progress, arc, arcIndex: i + 1, arcCount: arcList.length });
+        },
+        isStale
+      );
+      if (!merged.wiki) merged.wiki = result.wiki;
+      for (const ep of result.episodes || []) {
+        if (seenEpisodeTitles.has(ep.title)) continue; // same episode surfaced under more than one arc guess
+        seenEpisodeTitles.add(ep.title);
+        merged.episodes.push(ep);
+      }
+      for (const ch of result.characters || []) {
+        if (seenCharacterNames.has(ch.name)) continue; // recurring character across arcs — keep the first copy
+        seenCharacterNames.add(ch.name);
+        merged.characters.push(ch);
+      }
+      if (result.warnings && result.warnings.length) {
+        const prefix = arc ? `[${arc}] ` : '';
+        merged.warnings.push(...result.warnings.map((w) => `${prefix}${w}`));
+      }
+      merged.episodesRequested += result.episodesRequested || 0;
+      merged.charactersRequested += result.charactersRequested || 0;
+      if (result.episodeCategoryArcScoped !== true) merged.episodeCategoryArcScoped = false;
+      if (result.characterCategoryArcScoped !== true) merged.characterCategoryArcScoped = false;
+      merged.perArc.push({
+        arc,
+        arcResolvedTitle: result.arcResolvedTitle,
+        episodesRequested: result.episodesRequested,
+        episodeCategoryArcScoped: result.episodeCategoryArcScoped === true,
+        charactersRequested: result.charactersRequested,
+        characterCategoryArcScoped: result.characterCategoryArcScoped === true,
+      });
+    }
+    return merged;
+  }
+
   // ================= Entity index + chat-aware matching =================
   // Turns the corpus into one lookup-able block per episode/character, then
   // matches those against whatever's actually been said in the chat, so we
@@ -563,6 +760,10 @@
   // that gap meant the model's grounding in what it's portraying depended
   // entirely on TypingMind's own handling of the agent's `instruction` field
   // for that window. Always emitting the header removes that dependency.
+  // `arc` here is just a display string — the caller passes
+  // state.parsed.arcs.join(', ') now that an instruction can name several
+  // arcs, so this can be "Arc 1, Arc 2, Arc 3" as easily as a single arc;
+  // this function doesn't need to know or care how many there are.
   function composeInjection(active, mentionedOnly, wiki, arc) {
     let header = `Canon reference: ${wiki.sitename}\nSource: ${wiki.url}\n`;
     if (arc) header += `Scoped to: ${arc}\n`;
@@ -661,6 +862,11 @@
   // than parseSystemPrompt produces. This command reads the same rows
   // lore.js would, under this same deployment, so it can't be fooled by
   // either of those — if it also says "missing," the gap is real.
+  // Checks every arc named in the instruction, one dryRun call each (lore.js
+  // only ever scopes a single call to one arc — see its file header — so
+  // there's no single query that covers several at once). Returns an array
+  // of { arc, result } — even for a single-arc (or no-arc) instruction, so
+  // the return shape doesn't change based on how many arcs were requested.
   window.LoreFetchCheckMissing = async function () {
     const chatId = getCurrentChatId();
     if (!chatId) {
@@ -679,56 +885,65 @@
       console.warn("[LoreFetch] This chat's agent instructions don't match the fandom template — nothing to check.");
       return null;
     }
-    console.log('%c[LoreFetch] Checking Supabase (read-only) for', 'color:#f0b429;font-weight:bold', parsed);
-    let result;
-    try {
-      result = await callLoreApiOnce({ ...parsed, dryRun: true });
-    } catch (err) {
-      console.error('[LoreFetch] check request failed:', err);
-      return null;
-    }
-    if (result.error) {
-      console.error('[LoreFetch] check failed:', result.error);
-      return result;
-    }
-    window.LoreFetchLastCheck = result;
-    console.log(
-      `%c[LoreFetch] Episode category: ${result.episodeCategory || '(none found)'}` +
-        `${result.episodeCategory ? (result.episodeCategoryArcScoped ? ' — arc-scoped' : ' — NOT arc-scoped, likely whole-series') : ''}`,
-      'color:#7dd3fc'
-    );
-    console.log(
-      `%c[LoreFetch] Character source: ${result.characterCategory || '(none found)'}` +
-        `${result.characterCategory ? (result.characterCategoryArcScoped ? ' — arc-scoped' : ' — NOT arc-scoped, likely whole-series cast') : ''}` +
-        // characterSource is new (see lore.js): 'season-page' means this list came
-        // from reading the season's own Cast/Characters section (the accurate,
-        // preferred path); 'category' means it fell back to guessing a separate
-        // "<arc> Characters"-style category page instead — worth knowing which one
-        // fired when checking whether a scoped result can be trusted.
-        `${result.characterSource ? ` [source: ${result.characterSource}]` : ''}`,
-      'color:#7dd3fc'
-    );
-    if (result.episodeStatus && result.episodeStatus.length) console.table(result.episodeStatus);
-    if (result.characterStatus && result.characterStatus.length) console.table(result.characterStatus);
-    if (result.missingEpisodes.length) {
-      console.warn(
-        `%c[LoreFetch] ${result.missingEpisodes.length}/${result.episodesRequested} episode title(s) are NOT usable in Supabase right now (missing, cached-empty, or stale):`,
-        'color:#f04545;font-weight:bold',
-        result.missingEpisodes
-      );
-    } else if (result.episodesRequested > 0) {
+    const { arcs, ...rest } = parsed;
+    const arcList = arcs && arcs.length ? arcs : [null];
+    const allResults = [];
+    for (const arc of arcList) {
+      console.log('%c[LoreFetch] Checking Supabase (read-only) for', 'color:#f0b429;font-weight:bold', { ...rest, arc });
+      let result;
+      try {
+        result = await callLoreApiOnce({ ...rest, arc, dryRun: true });
+      } catch (err) {
+        console.error(`[LoreFetch] check request failed for "${arc || '(whole series)'}":`, err);
+        allResults.push({ arc, result: null });
+        continue;
+      }
+      if (result.error) {
+        console.error(`[LoreFetch] check failed for "${arc || '(whole series)'}":`, result.error);
+        allResults.push({ arc, result });
+        continue;
+      }
+      const tag = arc ? `[${arc}] ` : '';
       console.log(
-        '%c[LoreFetch] Every requested episode title has a real row with plot text in Supabase — the DB agrees with the badge. If your own check still shows nothing, check that it is reading the SAME Supabase project this deployment uses, and that any `arc` filter matches the casing lore.js writes (e.g. "Season 5", not "season 5").',
-        'color:#45c97a'
+        `%c[LoreFetch] ${tag}Episode category: ${result.episodeCategory || '(none found)'}` +
+          `${result.episodeCategory ? (result.episodeCategoryArcScoped ? ' — arc-scoped' : ' — NOT arc-scoped, likely whole-series') : ''}`,
+        'color:#7dd3fc'
       );
-    } else {
-      console.warn('[LoreFetch] episodesRequested is 0 — the episode category itself was never resolved, so there was nothing to check episode-by-episode. See warnings below.');
+      console.log(
+        `%c[LoreFetch] ${tag}Character source: ${result.characterCategory || '(none found)'}` +
+          `${result.characterCategory ? (result.characterCategoryArcScoped ? ' — arc-scoped' : ' — NOT arc-scoped, likely whole-series cast') : ''}` +
+          // characterSource is new (see lore.js): 'season-page' means this list came
+          // from reading the season's own Cast/Characters section (the accurate,
+          // preferred path); 'category' means it fell back to guessing a separate
+          // "<arc> Characters"-style category page instead — worth knowing which one
+          // fired when checking whether a scoped result can be trusted.
+          `${result.characterSource ? ` [source: ${result.characterSource}]` : ''}`,
+        'color:#7dd3fc'
+      );
+      if (result.episodeStatus && result.episodeStatus.length) console.table(result.episodeStatus);
+      if (result.characterStatus && result.characterStatus.length) console.table(result.characterStatus);
+      if (result.missingEpisodes.length) {
+        console.warn(
+          `%c[LoreFetch] ${tag}${result.missingEpisodes.length}/${result.episodesRequested} episode title(s) are NOT usable in Supabase right now (missing, cached-empty, or stale):`,
+          'color:#f04545;font-weight:bold',
+          result.missingEpisodes
+        );
+      } else if (result.episodesRequested > 0) {
+        console.log(
+          `%c[LoreFetch] ${tag}Every requested episode title has a real row with plot text in Supabase — the DB agrees with the badge. If your own check still shows nothing, check that it is reading the SAME Supabase project this deployment uses, and that any \`arc\` filter matches the casing lore.js writes (e.g. "Season 5", not "season 5").`,
+          'color:#45c97a'
+        );
+      } else {
+        console.warn(`[LoreFetch] ${tag}episodesRequested is 0 — the episode category itself was never resolved, so there was nothing to check episode-by-episode. See warnings below.`);
+      }
+      if (result.missingCharacters.length) {
+        console.warn(`[LoreFetch] ${tag}${result.missingCharacters.length}/${result.charactersRequested} character title(s) are NOT usable in Supabase right now:`, result.missingCharacters);
+      }
+      if (result.warnings && result.warnings.length) console.log(`[LoreFetch] ${tag}warnings:`, result.warnings);
+      allResults.push({ arc, result });
     }
-    if (result.missingCharacters.length) {
-      console.warn(`[LoreFetch] ${result.missingCharacters.length}/${result.charactersRequested} character title(s) are NOT usable in Supabase right now:`, result.missingCharacters);
-    }
-    if (result.warnings && result.warnings.length) console.log('[LoreFetch] warnings:', result.warnings);
-    return result;
+    window.LoreFetchLastCheck = allResults;
+    return allResults;
   };
 
   // ================= Sidebar icon (matches TypingMind's own nav tabs) =================
@@ -1005,13 +1220,18 @@
 
     const parsed = parseSystemPrompt(agent.instruction);
     if (!parsed || !parsed.fandom) return { status: 'skipped' };
+    // Display label for badges/messages — "Arc 1, Arc 2, Arc 3" when
+    // several were named, the single arc string when there's just one,
+    // '' when none was requested at all (whole series).
+    const arcsLabel = parsed.arcs.join(', ');
 
     try {
-      const corpus = await fetchLoreCorpus(
+      const corpus = await fetchLoreCorpusForArcs(
         forceRefresh ? { ...parsed, forceRefresh: true } : parsed,
         (progress) => {
           if (isStale && isStale()) return; // this chat isn't the active one anymore — don't repaint its badge
-          setBadgeState('working', `Fetching lore\u2026 ${progress.total - progress.remaining}/${progress.total} pages`);
+          const arcTag = progress.arcCount > 1 ? `${progress.arc || 'whole series'} (${progress.arcIndex}/${progress.arcCount}) \u2014 ` : '';
+          setBadgeState('working', `Fetching lore\u2026 ${arcTag}${progress.total - progress.remaining}/${progress.total} pages`);
         },
         isStale
       );
@@ -1019,16 +1239,17 @@
       const entityIndex = buildEntityIndex(corpus);
       window.LoreFetchLastWarnings = corpus.warnings || [];
       if (!entityIndex.length) {
-        return { status: 'error', warnings: corpus.warnings, fandom: parsed.fandom, arc: parsed.arc };
+        return { status: 'error', warnings: corpus.warnings, fandom: parsed.fandom, arc: arcsLabel || null };
       }
       // done:true only ever meant "nothing left in `missing`" — that's
       // trivially true if the episode category was never found, so treat
-      // "an arc was requested but 0 episodes were resolved for it" as its
-      // own status instead of letting it read as a plain, unqualified
-      // success just because some characters happened to match. See the
-      // episodesRequested doc comment in lore.js's file header.
+      // "arcs were requested but 0 episodes were resolved across ALL of
+      // them" as its own status instead of letting it read as a plain,
+      // unqualified success just because some characters happened to
+      // match. See the episodesRequested doc comment in lore.js's file
+      // header.
       const episodesRequested = typeof corpus.episodesRequested === 'number' ? corpus.episodesRequested : corpus.episodes.length;
-      if (parsed.arc && episodesRequested === 0) {
+      if (parsed.arcs.length && episodesRequested === 0) {
         return {
           status: 'partial',
           chatKey: chatEntry.key,
@@ -1037,26 +1258,26 @@
           corpus,
           entityIndex,
           lastMatchedKey: null,
-          partialReason: `No episodes were found for "${parsed.arc}" — only character info is available. The episode category on ${corpus.wiki.sitename} likely wasn't matched (check the warnings below); run window.LoreFetchRefresh() after fixing/redeploying lore.js.`,
+          partialReason: `No episodes were found for "${arcsLabel}" — only character info is available. The episode category on ${corpus.wiki.sitename} likely wasn't matched (check the warnings below); run window.LoreFetchRefresh() after fixing/redeploying lore.js.`,
         };
       }
       // Same idea as the 0-episodes check above, but for whether the
-      // resolved episode list is actually SCOPED to the arc at all, not just
-      // non-empty. lore.js already reports this — episodeCategoryArcScoped
-      // is only true when a real arc-scoped category or arc page was found
-      // (see the ARC SCOPING — EPISODES note in lore.js's file header); when
-      // it's false but episodesRequested > 0, the wiki-wide "Episodes"
-      // catch-all won and got run through, at best, a best-effort NUMBER
-      // filter (filterTitlesToArc) that's a silent no-op on any wiki whose
-      // episode titles don't encode a season number — meaning corpus.episodes
-      // can silently be every episode from every season, not just this one.
-      // THIS CHECK WAS MISSING, which is exactly how episodes for seasons
-      // nobody asked for were ending up injected: the character-arc-scoped
-      // check below caught the equivalent character-side gap, but nothing
-      // was reading episodeCategoryArcScoped, so this fell straight through
-      // to 'ready' and got treated as a full, correctly-scoped success.
+      // resolved episode list is actually SCOPED to the arc(s) at all, not
+      // just non-empty. episodeCategoryArcScoped is a conservative AND
+      // across every requested arc (see fetchLoreCorpusForArcs) — it's only
+      // true when EVERY arc individually found a real arc-scoped category
+      // or arc page (see the ARC SCOPING — EPISODES note in lore.js's file
+      // header). When it's false but episodesRequested > 0, at least one
+      // arc's episode list came from a wiki-wide catch-all narrowed only by
+      // a best-effort NUMBER filter (filterTitlesToArc) — a silent no-op on
+      // any wiki whose episode titles don't encode a season number — so
+      // corpus.episodes may silently contain episodes from arcs nobody
+      // asked for. corpus.perArc (see below) names exactly which arc(s).
       const episodeCategoryArcScoped = corpus.episodeCategoryArcScoped === true;
-      if (parsed.arc && episodesRequested > 0 && !episodeCategoryArcScoped) {
+      const unscopedEpisodeArcs = (corpus.perArc || [])
+        .filter((a) => (a.episodesRequested || 0) > 0 && !a.episodeCategoryArcScoped)
+        .map((a) => a.arc || '(whole series)');
+      if (parsed.arcs.length && episodesRequested > 0 && !episodeCategoryArcScoped) {
         return {
           status: 'partial',
           chatKey: chatEntry.key,
@@ -1065,20 +1286,23 @@
           corpus,
           entityIndex,
           lastMatchedKey: null,
-          partialReason: `Episodes aren't scoped to "${parsed.arc}" — no episode category or arc page specific to "${parsed.arc}" was found on ${corpus.wiki.sitename}, so this list came from a wiki-wide catch-all narrowed only by a best-effort guess at a season number in each title (check the warnings below — if it says the filter matched every title, none of them encode a season number and this is the WHOLE-SERIES episode list). Treat the episode corpus as possibly unscoped. Add "Also fetch the episode <Title>." lines to the instructions to hand-pick specific ones instead.`,
+          partialReason: `Episodes aren't scoped correctly for: ${unscopedEpisodeArcs.join(', ') || arcsLabel} — no episode category or arc page specific to ${unscopedEpisodeArcs.length > 1 ? 'these arcs' : `"${unscopedEpisodeArcs[0] || arcsLabel}"`} was found on ${corpus.wiki.sitename}, so that arc's episode list came from a wiki-wide catch-all narrowed only by a best-effort guess at a season number in each title (check the warnings below — if it says the filter matched every title, none of them encode a season number and this is the WHOLE-SERIES episode list). Treat the episode corpus as possibly unscoped. Add "Also fetch the episode <Title>." lines to the instructions to hand-pick specific ones instead.`,
         };
       }
 
-      // Same idea as the episode check above, but for characters: an arc was
-      // requested, yet neither lore.js's season-page read nor its category
-      // guess turned up an arc-scoped source (see characterSource/the ARC
-      // SCOPING — CHARACTERS note in lore.js's file header), so
-      // corpus.characters is this wiki's whole-series cast rather than just
-      // "<arc>"'s characters. Worth flagging on the badge, not just in the
+      // Same idea as the episode check above, but for characters: at least
+      // one requested arc found neither an arc-scoped season page (see
+      // characterSource/the ARC SCOPING — CHARACTERS note in lore.js's file
+      // header) nor an arc-scoped category, so corpus.characters may
+      // include this wiki's whole-series cast rather than just the
+      // requested arc(s)'. Worth flagging on the badge, not just in the
       // console, since a full cast list can otherwise look identical to a
       // correctly-scoped one.
       const characterCategoryArcScoped = corpus.characterCategoryArcScoped === true;
-      if (parsed.arc && !characterCategoryArcScoped) {
+      const unscopedCharacterArcs = (corpus.perArc || [])
+        .filter((a) => !a.characterCategoryArcScoped)
+        .map((a) => a.arc || '(whole series)');
+      if (parsed.arcs.length && !characterCategoryArcScoped) {
         return {
           status: 'partial',
           chatKey: chatEntry.key,
@@ -1088,7 +1312,7 @@
           entityIndex,
           lastMatchedKey: null,
           partialReason: corpus.characterCategory
-            ? `Characters aren't scoped to "${parsed.arc}" — no season page (with a Cast/Characters section) or category specific to "${parsed.arc}" was found, so this is ${corpus.wiki.sitename}'s whole-series cast, not just "${parsed.arc}"'s.${episodeCategoryArcScoped ? ' Episodes are still correctly scoped.' : ' Episodes are also unscoped (see above).'} Add "Also fetch the character <Name>." lines to the instructions to hand-pick specific ones instead.`
+            ? `Characters aren't scoped correctly for: ${unscopedCharacterArcs.join(', ') || arcsLabel} — no season page (with a Cast/Characters section) or category specific to ${unscopedCharacterArcs.length > 1 ? 'these arcs' : `"${unscopedCharacterArcs[0] || arcsLabel}"`} was found, so this includes ${corpus.wiki.sitename}'s whole-series cast, not just the requested arc(s)'.${episodeCategoryArcScoped ? ' Episodes are still correctly scoped.' : ' Episodes are also unscoped (see above).'} Add "Also fetch the character <Name>." lines to the instructions to hand-pick specific ones instead.`
             : `No season page or character category was found on ${corpus.wiki.sitename} at all — no character info is available for this fandom. Check the warnings below.`,
         };
       }
@@ -1100,7 +1324,7 @@
       // console. Falls back to the bare message for anything else (network
       // errors, a genuine server-side { error } response, etc).
       const warnings = err && err.warnings && err.warnings.length ? [...new Set(err.warnings)].slice(-8) : [(err && err.message) || String(err)];
-      return { status: 'error', warnings, fandom: parsed.fandom, arc: parsed.arc };
+      return { status: 'error', warnings, fandom: parsed.fandom, arc: arcsLabel || null };
     }
   }
 
@@ -1121,8 +1345,12 @@
     ].sort().join('|');
     if (matchedKey === state.lastMatchedKey) return;
 
-    const marker = `${MARKER_PREFIX}${state.agentId}:${state.parsed.fandom}:${state.parsed.arc || ''} -->`;
-    const injected = composeInjection(active, mentionedOnly, state.corpus.wiki, state.parsed.arc);
+    // Comma-joined display label — "Arc 1, Arc 2, Arc 3" when several arcs
+    // were requested, a single arc string when there's just one, '' for
+    // none (whole series). Used anywhere `arc` used to be shown/keyed on.
+    const arcsLabel = state.parsed.arcs.join(', ');
+    const marker = `${MARKER_PREFIX}${state.agentId}:${state.parsed.fandom}:${arcsLabel} -->`;
+    const injected = composeInjection(active, mentionedOnly, state.corpus.wiki, arcsLabel);
     const text = `${marker}\n${injected}`;
     window.LoreFetchLastContext = text;
 
@@ -1156,12 +1384,12 @@
     if (state.status === 'partial') {
       setBadgeState(
         'partial',
-        `<strong>${state.parsed.fandom}</strong>${state.parsed.arc ? ' — ' + state.parsed.arc : ''}<br>${counts}<br><span style="color:#f0b429">${state.partialReason || 'Incomplete: 0 episodes were resolved for this arc.'}</span>`
+        `<strong>${state.parsed.fandom}</strong>${arcsLabel ? ' — ' + arcsLabel : ''}<br>${counts}<br><span style="color:#f0b429">${state.partialReason || 'Incomplete: 0 episodes were resolved for one or more of these arcs.'}</span>`
       );
     } else {
       setBadgeState(
         'success',
-        `<strong>${state.parsed.fandom}</strong>${state.parsed.arc ? ' — ' + state.parsed.arc : ''}<br>${counts}`
+        `<strong>${state.parsed.fandom}</strong>${arcsLabel ? ' — ' + arcsLabel : ''}<br>${counts}`
       );
     }
   }
@@ -1230,7 +1458,7 @@
             stopRechecking();
           } else if (result.status === 'error') {
             const detail = (result.warnings || []).join('<br>') || 'Could not find matching wiki content.';
-            setBadgeState('error', `<strong>${result.fandom || ''}</strong><br>${detail}`);
+            setBadgeState('error', `<strong>${result.fandom || ''}</strong>${result.arc ? ' — ' + result.arc : ''}<br>${detail}`);
             stopRechecking();
           } else if (result.status === 'ready' || result.status === 'partial') {
             activeState = result;
