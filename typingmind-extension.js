@@ -932,7 +932,7 @@
     idle: 'Lore',
     working: 'Fetching lore…',
     success: 'Lore fetched',
-    partial: 'Lore — incomplete (0 episodes found)',
+    partial: 'Lore — incomplete (click for details)',
     skipped: 'Lore — not applicable',
     error: 'Lore — error',
   };
@@ -1040,6 +1040,35 @@
           partialReason: `No episodes were found for "${parsed.arc}" — only character info is available. The episode category on ${corpus.wiki.sitename} likely wasn't matched (check the warnings below); run window.LoreFetchRefresh() after fixing/redeploying lore.js.`,
         };
       }
+      // Same idea as the 0-episodes check above, but for whether the
+      // resolved episode list is actually SCOPED to the arc at all, not just
+      // non-empty. lore.js already reports this — episodeCategoryArcScoped
+      // is only true when a real arc-scoped category or arc page was found
+      // (see the ARC SCOPING — EPISODES note in lore.js's file header); when
+      // it's false but episodesRequested > 0, the wiki-wide "Episodes"
+      // catch-all won and got run through, at best, a best-effort NUMBER
+      // filter (filterTitlesToArc) that's a silent no-op on any wiki whose
+      // episode titles don't encode a season number — meaning corpus.episodes
+      // can silently be every episode from every season, not just this one.
+      // THIS CHECK WAS MISSING, which is exactly how episodes for seasons
+      // nobody asked for were ending up injected: the character-arc-scoped
+      // check below caught the equivalent character-side gap, but nothing
+      // was reading episodeCategoryArcScoped, so this fell straight through
+      // to 'ready' and got treated as a full, correctly-scoped success.
+      const episodeCategoryArcScoped = corpus.episodeCategoryArcScoped === true;
+      if (parsed.arc && episodesRequested > 0 && !episodeCategoryArcScoped) {
+        return {
+          status: 'partial',
+          chatKey: chatEntry.key,
+          agentId,
+          parsed,
+          corpus,
+          entityIndex,
+          lastMatchedKey: null,
+          partialReason: `Episodes aren't scoped to "${parsed.arc}" — no episode category or arc page specific to "${parsed.arc}" was found on ${corpus.wiki.sitename}, so this list came from a wiki-wide catch-all narrowed only by a best-effort guess at a season number in each title (check the warnings below — if it says the filter matched every title, none of them encode a season number and this is the WHOLE-SERIES episode list). Treat the episode corpus as possibly unscoped. Add "Also fetch the episode <Title>." lines to the instructions to hand-pick specific ones instead.`,
+        };
+      }
+
       // Same idea as the episode check above, but for characters: an arc was
       // requested, yet neither lore.js's season-page read nor its category
       // guess turned up an arc-scoped source (see characterSource/the ARC
@@ -1059,7 +1088,7 @@
           entityIndex,
           lastMatchedKey: null,
           partialReason: corpus.characterCategory
-            ? `Characters aren't scoped to "${parsed.arc}" — no season page (with a Cast/Characters section) or category specific to "${parsed.arc}" was found, so this is ${corpus.wiki.sitename}'s whole-series cast, not just "${parsed.arc}"'s. Episodes are still correctly scoped. Add "Also fetch the character <Name>." lines to the instructions to hand-pick specific ones instead.`
+            ? `Characters aren't scoped to "${parsed.arc}" — no season page (with a Cast/Characters section) or category specific to "${parsed.arc}" was found, so this is ${corpus.wiki.sitename}'s whole-series cast, not just "${parsed.arc}"'s.${episodeCategoryArcScoped ? ' Episodes are still correctly scoped.' : ' Episodes are also unscoped (see above).'} Add "Also fetch the character <Name>." lines to the instructions to hand-pick specific ones instead.`
             : `No season page or character category was found on ${corpus.wiki.sitename} at all — no character info is available for this fandom. Check the warnings below.`,
         };
       }
