@@ -65,6 +65,21 @@
  * NUMBER-based episode fallback filter (filterTitlesToArc, which needs an
  * actual digit) and for everything echoed back to the caller.
  *
+ * FIX (2026-08): the above only actually worked on wikis whose index page is
+ * an ORDERED ("#") wikitext list. Lookism's own "Arc Guide" — the motivating
+ * example this feature was built for — turned out to render as an
+ * UNORDERED ("*") list instead (confirmed by fetching the live page: no
+ * numbering is visible anywhere on it), which parseArcIndexWikitext's old
+ * "#"-only regex silently parsed as zero entries. That's not a "page not
+ * found" — resolveArcTitleFromIndex found the page fine, got nothing usable
+ * out of it, and quietly fell through to "no index page found," so "Arc 2"
+ * was NEVER actually resolved to "Breakaway" on the one wiki this whole
+ * mechanism exists for. parseArcIndexWikitext now matches "#" OR "*"
+ * top-level list lines, and a found-but-unparseable index page now pushes
+ * its own distinct warning (previously indistinguishable from "no such
+ * page" from the outside). See parseArcIndexWikitext's own comment for the
+ * full explanation.
+ *
  * ARC SCOPING — EPISODES: when `arc` is passed, episode category guessing
  * tries arc-scoped category names first (e.g. "Charmed Season 1 Episodes",
  * "Season 1 Episodes", and — FIX (2026-08) — the "/" subcategory form some
@@ -97,9 +112,11 @@
  * stages (see findSeasonPageCharacters / buildCharacterCategoryGuesses,
  * called in that order from the handler). Stage 1 itself has two tiers:
  *   1. SEASON PAGE (primary): fetch the season's own Fandom page (e.g.
- *      "Season 6", or — FIX (2026-08) — "<Fandom>/<Arc>" for wikis that
- *      subpage it instead, e.g. "Stranger Things/Season 1"; see
- *      buildSeasonPageGuesses) and read the character links off of it. This
+ *      "Season 6", "<Fandom>/<Arc>" for wikis that subpage it instead, e.g.
+ *      "Stranger Things/Season 1", or — FIX (2026-08) — "<Fandom>: <Arc>"
+ *      for wikis that colon-join it instead, e.g. "Saved by the Bell:
+ *      Season 1" on Saved By The Bell Wiki; see buildSeasonPageGuesses) and
+ *      read the character links off of it. This
  *      is tried first because real single-show wikis commonly give a season
  *      a proper cast listing on its own page without ALSO filing those same
  *      characters under a matching per-season CATEGORY — which is exactly
@@ -588,7 +605,27 @@ function buildSeasonPageGuesses(fandom, year, arc) {
   if (!arc) return [];
   const guesses = [];
   if (year) guesses.push(`${fandom} (${year}) ${arc}`);
+  // FIX (2026-08): some multi-version wikis join the show name and the
+  // season with a literal COLON instead of a space — confirmed as the
+  // ACTUAL page titles on Saved By The Bell Wiki: "Saved by the Bell:
+  // Season 1" (https://savedbythebell.fandom.com/wiki/Saved_by_the_Bell:_Season_1),
+  // and the same convention on that wiki's own reboot/spinoff, "Saved by
+  // the Bell (2020): Season 1" — NOT "Saved by the Bell Season 1" (space,
+  // no colon), which doesn't exist there as a page or a redirect. This is
+  // exactly the kind of wiki this file's season-page-first strategy exists
+  // for (see findSeasonPageCharacters/findArcPageEpisodes): it organizes by
+  // season PAGE rather than by a per-season CATEGORY, so without this guess
+  // BOTH functions found nothing under any other guess here and fell all
+  // the way through to the wiki-wide category + best-effort number-filter
+  // fallback in the handler — a silent no-op on a wiki whose episode titles
+  // don't encode a season number (e.g. "Dancing to the Max"), so it
+  // silently handed back every episode from every season instead of just
+  // the one that was actually requested. Tried right after the space-joined
+  // year-qualified guess, for the same disambiguation-first reasoning as
+  // the rest of this list.
+  if (year) guesses.push(`${fandom} (${year}): ${arc}`);
   guesses.push(`${fandom} ${arc}`);
+  guesses.push(`${fandom}: ${arc}`);
   // Same "/" subpage convention noted in buildEpisodeCategoryGuesses —
   // confirmed as the ACTUAL page title on Stranger Things Wiki:
   // "Stranger Things/Season 1", not "Stranger Things Season 1" (which
@@ -597,6 +634,18 @@ function buildSeasonPageGuesses(fandom, year, arc) {
   // season page and always fell through to a wiki-wide fallback).
   guesses.push(`${fandom}/${arc}`);
   guesses.push(arc);
+  // Confirmed on Lookism's own Category:Story_Arcs: arc page titles are NOT
+  // consistently bare — "Breakaway" and "Cult" sit right alongside
+  // disambiguated titles like "Cheonliang Arc" and "James Lee (Arc)" (needed
+  // because "James Lee" and "Daniel Park" are ALSO character page titles on
+  // the same wiki). resolveArcTitleFromIndex normally sidesteps this by
+  // reading the real page title straight off the guide's own wikilink TARGET
+  // (see parseArcIndexWikitext) — but an entry with no link at all yet (a
+  // recent, not-yet-wikified arc) falls back to plain display text, which
+  // won't include a suffix it doesn't display. Trying both suffixed forms
+  // here, after the bare guess, is a cheap fallback for exactly that case.
+  guesses.push(`${arc} Arc`);
+  guesses.push(`${arc} (Arc)`);
   return [...new Set(guesses.filter(Boolean))];
 }
 
@@ -629,27 +678,48 @@ function buildArcIndexPageGuesses(fandom, year, arcLabel) {
 // out entry N by plain array index, the same way a human counting down a
 // rendered numbered list would.
 //
-// Counts wikitext's OWN numbering: a run of consecutive top-level "# ..."
-// lines (MediaWiki's numbered-list syntax — this is what renders as the <ol>
-// on the page). Deliberately does NOT look for a number written inside the
-// line's own text, because there usually isn't one (that's the whole
-// problem this feature exists to solve) — the line's POSITION in the list is
-// the only thing that reliably means "arc N". Nested/indented sub-bullets
-// some wikis use for asides ("##", "#*", "#:") are skipped so they can't
-// throw off the count.
+// Counts wikitext's OWN numbering: a run of consecutive top-level "# ..." OR
+// "* ..." lines (MediaWiki's ordered- and unordered-list syntax respectively
+// — whichever one renders as the page's actual list). Deliberately does NOT
+// look for a number written inside the line's own text, because there
+// usually isn't one (that's the whole problem this feature exists to solve)
+// — the line's POSITION in the list is the only thing that reliably means
+// "arc N". Nested/indented sub-bullets some wikis use for asides ("##",
+// "#*", "*#", "**", "#:", "*:") are skipped so they can't throw off the
+// count.
+//
+// FIX (2026-08): originally "#" only, on the assumption that an arc/season
+// index page would be a numbered list. CONFIRMED WRONG on Lookism's own "Arc
+// Guide" — https://lookism.fandom.com/wiki/Arc_Guide renders with no visible
+// numbering at all (fetched and checked directly), which is what an
+// unordered "*" list looks like, not an ordered "#" one. With "#" only, this
+// function silently returned ZERO entries for the wiki this whole feature
+// was built around: resolveArcTitleFromIndex would find the "Arc Guide"
+// page, get nothing parseable from it, and fall through to "no index page
+// found" — meaning "Arc 2" was NEVER actually resolved to "Breakaway", and
+// every guess below it kept building from the literal, wiki-doesn't-use-that
+// "Arc 2" text the whole time. Matching either marker fixes this without
+// affecting wikis that genuinely do use "#" (Charmed's own season-numbering
+// pattern, if such a wiki ever needed this path, keeps working identically).
+// A page whose real arc list happens to sit right after an unrelated "*" or
+// "#" list earlier on the same page (e.g. a stray bulleted note above the
+// actual list) would still miscount — this is a flat scan of the whole
+// page's top-level list lines, not a "first contiguous block only" parse —
+// but that's a pre-existing limitation of the position-counting approach
+// itself, not something this fix introduces.
 //
 // For each top-level line, prefers the wikilink's TARGET over its display
-// text: on Lookism's own guide, entry #5 displays "Jay Hong" but actually
-// links to the page "Jay Arc" — every OTHER guess-builder in this file needs
-// that real page/category name, not the human-friendly label shown next to
-// it. Falls back to the line's own plain text (with '' / ''' bold-italic
-// markup stripped) for an entry that has no link at all yet — e.g. the last,
-// not-yet-written entry on Lookism's guide — since that's no less useful
-// than refusing to resolve it at all.
+// text: on Lookism's own guide, an entry can display "Jay Hong" but actually
+// link to the page "Jay Hong (Arc)" or similar — every OTHER guess-builder in
+// this file needs that real page/category name, not the human-friendly label
+// shown next to it. Falls back to the line's own plain text (with '' / '''
+// bold-italic markup stripped) for an entry that has no link at all yet —
+// e.g. a not-yet-written recent entry on Lookism's guide — since that's no
+// less useful than refusing to resolve it at all.
 function parseArcIndexWikitext(wikitext) {
   const entries = [];
   for (const rawLine of wikitext.split('\n')) {
-    const m = rawLine.match(/^#(?![#*:])\s*(.*)$/);
+    const m = rawLine.match(/^[#*](?![#*:])\s*(.*)$/);
     if (!m) continue;
     const line = m[1];
     const linkMatch = line.match(/\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/);
@@ -1146,7 +1216,18 @@ async function resolveArcTitleFromIndex(subdomain, wikiId, fandom, year, arc, fr
       continue; // no page by this exact title on the wiki — try the next guess
     }
     const entries = parseArcIndexWikitext(wikitext);
-    if (!entries.length) continue; // page exists but has no numbered list on it — try the next guess
+    if (!entries.length) {
+      // The page itself was found (fetchRawWikitext didn't throw), but no
+      // top-level "#"/"*" list line was parseable from it — worth a warning
+      // distinct from "no such page," since this is the specific failure
+      // mode a wiki with, say, a template-generated list (no literal
+      // wikitext list markup at all) would hit even after the marker fix
+      // above. Without this, that case looked identical to "no index page
+      // exists" from the outside, which made it hard to tell the two apart
+      // from window.LoreFetchLastWarnings alone.
+      warnings.push(`Found arc/season index page "${pageTitle}" but couldn't parse any top-level list entries from its wikitext (checked for "#" and "*" list lines) — trying the next guess.`);
+      continue; // try the next guess
+    }
 
     const resolvedTitle = entries[num - 1];
     if (!resolvedTitle) {
