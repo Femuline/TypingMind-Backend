@@ -292,6 +292,8 @@
  * origins in ALLOWED_ORIGINS below are allowed to call this function.
  */
 import { createClient } from '@supabase/supabase-js';
+import { waitUntil } from '@vercel/functions';
+import { cleanupWikiCharacters } from '../lib/cleanupCharacters.js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
@@ -2025,6 +2027,23 @@ export default async function handler(req, res) {
     if (emptyBulletTitles.length) {
       warnings.push(`${emptyBulletTitles.length} character(s) are cached but have no usable bio content, so they're excluded from the corpus: ${emptyBulletTitles.join(', ')}`);
     }
+
+    // SEARCH-TRIGGERED CLEANUP: run the same safety-net sweep
+    // lore-clean.js runs nightly on cron, but scoped to just THIS wiki
+    // and fired the moment a search actually finishes (done:true) —
+    // not on every intermediate done:false poll, since that would hit
+    // the Fandom API far more than needed for no benefit. waitUntil
+    // keeps this Vercel Function alive long enough for the sweep to
+    // finish WITHOUT making the client wait on it — the response below
+    // is sent first. If the sweep throws, it's caught and only logged:
+    // waitUntil doesn't retry a failed promise, so the nightly cron in
+    // lore-clean.js is what catches anything this misses (a cold
+    // shutdown mid-sweep, a Fandom API outage, etc).
+    waitUntil(
+      cleanupWikiCharacters(supabase, wikiRow, { maxCategoryChecks: 100 }).catch((err) => {
+        console.error(`[lore] post-search cleanup failed for ${wikiRow.fandom}:`, err.message);
+      })
+    );
 
     return res.status(200).json({
       done: true,
