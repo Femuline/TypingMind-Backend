@@ -1,9 +1,9 @@
 /**
- * lore-cleanup-cron.js
+ * lore-clean.js
  * ---------------------------------------------------------------
- * PLACE THIS FILE AT: api/lore-cleanup-cron.js in your project (same
+ * PLACE THIS FILE AT: api/lore-clean.js in your project (same
  * folder as your existing api/lore.js), so Vercel serves it at
- * /api/lore-cleanup-cron.
+ * /api/lore-clean.
  *
  * Automated replacement for manually running cleanup-lore-characters.mjs.
  * Runs on a Vercel Cron schedule (see the vercel.json snippet below) and
@@ -48,7 +48,7 @@
  * Don't want to wait for tonight's scheduled run? Trigger it yourself:
  *
  *   curl -H "Authorization: Bearer YOUR_CRON_SECRET" \
- *     https://<your-deployment>.vercel.app/api/lore-cleanup-cron
+ *     https://<your-deployment>.vercel.app/api/lore-clean
  *
  * Get YOUR_CRON_SECRET from Vercel → your project → Settings →
  * Environment Variables (it appears there automatically once a crons
@@ -61,7 +61,7 @@
  *
  *   {
  *     "crons": [
- *       { "path": "/api/lore-cleanup-cron", "schedule": "0 4 * * *" }
+ *       { "path": "/api/lore-clean", "schedule": "0 4 * * *" }
  *     ]
  *   }
  *
@@ -213,10 +213,10 @@ export default async function handler(req, res) {
       });
     }
 
-    console.log('[lore-cleanup-cron]', JSON.stringify(results));
+    console.log('[lore-clean]', JSON.stringify(results));
     return res.status(200).json({ ranAt: new Date().toISOString(), dryRun, results });
   } catch (err) {
-    console.error('[lore-cleanup-cron] failed:', err.message);
+    console.error('[lore-clean] failed:', err.message);
     return res.status(500).json({ error: err.message });
   }
 }
