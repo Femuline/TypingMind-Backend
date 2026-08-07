@@ -288,6 +288,60 @@
     }
   }
 
+  // ---------- Self-healing systemMessage write ----------
+  // See the file-header CAVEAT: a write here can lose a race against
+  // TypingMind's own autosave. If the app already has this chat loaded in
+  // memory, its autosave doesn't know we just edited the stored record — it
+  // just re-saves whatever it currently holds in memory, right on top of
+  // our write, silently. There's no documented hook to avoid this at the
+  // source (TypingMind's own extension docs only say "test carefully" for
+  // write operations: https://docs.typingmind.com/typingmind-extensions —
+  // there's no safe-merge API, no before-send hook, no documented schema to
+  // watch for).
+  //
+  // What we CAN do is detect it: write, wait a moment, read back what's
+  // actually stored, and if it no longer matches what we wrote, something
+  // clobbered it in between — so rewrite immediately and check again, up to
+  // MAX_WRITE_RETRIES times. This doesn't close the race at the exact
+  // instant of a send (that would need TypingMind to expose a real hook),
+  // but it turns "silently wrong until the next scheduled rescan" (up to
+  // ENTITY_RESCAN_MS later) into "usually corrected within about a
+  // second," and it surfaces a console warning when it happens so a clobber
+  // is at least visible instead of invisible.
+  const WRITE_VERIFY_DELAY_MS = 800; // how long to wait before checking whether our write survived
+  const MAX_WRITE_RETRIES = 3; // give up re-asserting after this many clobber-and-rewrite cycles
+
+  // `buildMessage(existingSystemMessage)` returns the new systemMessage to
+  // write; it's re-invoked against a FRESH read on every retry (not the
+  // stale `existing` from the first attempt), so a retry correctly builds
+  // on top of whatever TypingMind's autosave actually left behind, rather
+  // than blindly re-applying the first attempt's now-outdated base text.
+  async function writeSystemMessageWithVerify(storageKey, buildMessage, attempt = 1) {
+    const current = await kvGet(storageKey);
+    if (current === undefined) return false; // record vanished entirely — nothing to write onto
+    const chat = current;
+    chat.chatParams = chat.chatParams || {};
+    chat.chatParams.systemMessage = buildMessage(chat.chatParams.systemMessage || '');
+    const expected = chat.chatParams.systemMessage;
+    await kvPut(storageKey, chat);
+
+    await new Promise((resolve) => setTimeout(resolve, WRITE_VERIFY_DELAY_MS));
+
+    const after = await kvGet(storageKey);
+    const actual = after && after.chatParams && after.chatParams.systemMessage;
+    if (actual === expected) return true; // write held — nothing overwrote it in the meantime
+
+    console.warn(
+      '%c[LoreFetch] systemMessage was overwritten right after we wrote it (likely TypingMind\u2019s own autosave \u2014 see file header CAVEAT). Re-asserting the injected lore (attempt %d/%d).',
+      'color:#f59e0b', attempt, MAX_WRITE_RETRIES
+    );
+    if (attempt >= MAX_WRITE_RETRIES) {
+      console.error('[LoreFetch] Gave up re-asserting the injected lore after repeated clobbers \u2014 it may be missing from the model\u2019s next request. The next scheduled rescan will try again.');
+      return false;
+    }
+    return writeSystemMessageWithVerify(storageKey, buildMessage, attempt + 1);
+  }
+
   function getCurrentChatId() {
     const m = window.location.hash.match(/chat=([^&]+)/);
     return m ? m[1] : null;
@@ -1344,11 +1398,10 @@
     const text = `${marker}\n${injected}`;
     window.LoreFetchLastContext = text;
 
-    const existing = (chat.chatParams && chat.chatParams.systemMessage) || '';
-    const base = stripPreviousInjection(existing);
-    chat.chatParams = chat.chatParams || {};
-    chat.chatParams.systemMessage = base ? `${base}\n\n${text}` : text;
-    await kvPut(chatEntry.key, chat);
+    const held = await writeSystemMessageWithVerify(chatEntry.key, (existing) => {
+      const base = stripPreviousInjection(existing || '');
+      return base ? `${base}\n\n${text}` : text;
+    });
     state.lastMatchedKey = matchedKey;
 
     debugLog(
@@ -1357,8 +1410,8 @@
       '| mentioned-only:', mentionedOnly.map((m) => m.names[0])
     );
     console.log(
-      `%c[LoreFetch] Injected ${active.length} full profile${active.length === 1 ? '' : 's'} + ${mentionedOnly.length} stub${mentionedOnly.length === 1 ? '' : 's'} (${text.length} chars).`,
-      'color:#45f0a0;font-weight:bold'
+      `%c[LoreFetch] Injected ${active.length} full profile${active.length === 1 ? '' : 's'} + ${mentionedOnly.length} stub${mentionedOnly.length === 1 ? '' : 's'} (${text.length} chars)${held ? '' : ' \u2014 WRITE DID NOT HOLD, see warning above'}.`,
+      held ? 'color:#45f0a0;font-weight:bold' : 'color:#f59e0b;font-weight:bold'
     );
 
     // Always show the episode/character split, not just a combined count —
