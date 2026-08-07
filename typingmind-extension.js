@@ -51,18 +51,18 @@
  *      a recency heuristic, not real scene tracking: it can't tell
  *      "present in the scene" from "name-dropped in the latest
  *      message," but it fixes stale mentions from many turns back
- *      staying tagged as full matches. Each profile is also capped —
- *      personality/history to MAX_BULLETS_PER_CATEGORY bullets, every
- *      bullet (including uncapped-count powers/trivia) truncated to
- *      MAX_BULLET_CHARS, episode plots to MAX_PLOT_CHARS — and this
- *      happens once, when the corpus is indexed (buildEntityIndex), so
- *      it bounds what the extension keeps for EVERY character, not just
- *      the ones that end up matching a chat. Separately, the whole
- *      injected block enforces a hard ceiling (MAX_INJECTION_CHARS),
- *      checked on every rescan against whatever's currently matched —
- *      dropping stubs then whole profiles from the end of the match
- *      order before it would ever ship a giant wiki-sized dump — never
- *      a mid-block truncation.
+ *      staying tagged as full matches. Only PERSONALITY and HISTORY are
+ *      still capped — MAX_BULLETS_PER_CATEGORY bullets, each truncated to
+ *      MAX_BULLET_CHARS — applied once, when the corpus is indexed
+ *      (buildEntityIndex), so it bounds what the extension keeps for EVERY
+ *      character, not just the ones that end up matching a chat. POWERS,
+ *      TRIVIA, and EPISODE PLOT TEXT ARE ALL DELIBERATELY UNCAPPED — full
+ *      bullets/text, every time, matching classifyMatches's "active" tier
+ *      in full. There is also no ceiling on the injected block's overall
+ *      size — nothing is ever dropped to save space. This means a chat
+ *      that matches several characters/episodes at once can push a large
+ *      block into chatParams.systemMessage; that trade-off is intentional
+ *      here.
  *
  * DEBUGGING:
  * After any fetch (successful or not), the exact text that was/would be
@@ -141,18 +141,18 @@
   // they're applied once, when the corpus is indexed (see buildEntityIndex),
   // to every character in the corpus — so a bullet beyond the cap is simply
   // never kept in the entity index at all, regardless of whether that
-  // character ends up matching a chat later. This is a different kind of
-  // limit from MAX_INJECTION_CHARS below, which is a per-injection ceiling
-  // re-checked on every rescan against only whatever's currently matched.
+  // character ends up matching a chat later.
+  //
+  // Episode plot text and the overall injected block are DELIBERATELY left
+  // uncapped (no MAX_PLOT_CHARS, no MAX_INJECTION_CHARS): the plot is meant
+  // to always go in whole, and nothing should ever get silently dropped to
+  // stay under a size budget. Powers and trivia are ALSO uncapped — full
+  // bullets, any number, any length. ONLY personality and history are still
+  // capped: MAX_BULLETS_PER_CATEGORY limits how many bullets are kept, and
+  // MAX_BULLET_CHARS truncates any one of those bullets that's still too
+  // long — both applied only to personality/history, nowhere else.
   const MAX_BULLETS_PER_CATEGORY = 4; // personality/history only — long prose sections worth summarizing down
-  const MAX_BULLET_CHARS = 220; // safety net: truncate any single bullet longer than this, all categories
-  const MAX_PLOT_CHARS = 900; // truncate an episode's plot text in the full block
-  // Hard ceiling on the whole injected block, checked in composeInjection
-  // AFTER the per-category caps above. If still over budget, stub lines are
-  // dropped first (cheapest to lose), then whole full-profile blocks from
-  // the end of the match order — never a mid-block truncation, since a
-  // half-cut bullet list reads as broken but a dropped character doesn't.
-  const MAX_INJECTION_CHARS = 6000;
+  const MAX_BULLET_CHARS = 220; // personality/history only — safety net for a single freak long bullet
   const MARKER_PREFIX = '<!-- lorefetch:'; // marks our injected block so we can find/replace it
   // Backstop against an infinite fetch loop: if the server keeps returning
   // done:false round after round (e.g. because the same page fails every
@@ -664,22 +664,17 @@
     return (list || []).slice(0, max).map((b) => truncateText(b, MAX_BULLET_CHARS));
   }
 
-  // Same per-bullet MAX_BULLET_CHARS safety truncation as capBullets, but no
-  // count limit — for categories that are naturally short (powers, trivia)
-  // and don't need summarizing down the way personality/history do.
-  function truncateBullets(list) {
-    return (list || []).map((b) => truncateText(b, MAX_BULLET_CHARS));
-  }
-
   function buildEntityIndex(corpus) {
     const entities = [];
     for (const ep of corpus.episodes || []) {
       if (!ep.plot) continue;
-      const plot = truncateText(ep.plot, MAX_PLOT_CHARS);
+      // Full plot text, injected whole — no truncation. Only the stub below
+      // (used for the "mentioned, not active" tier) stays short, since that's
+      // a deliberate brief reference, not a size cap on the plot itself.
       entities.push({
         type: 'episode',
         names: [ep.title],
-        block: `### ${ep.title}\n${plot}`,
+        block: `### ${ep.title}\n${ep.plot}`,
         // Shown instead of the full block when this episode is only matched
         // in the outer "mentioned" window, not the recent "active" one.
         stub: `- **${ep.title}**: ${truncateText(ep.plot, 140)}`,
@@ -689,8 +684,9 @@
       const parts = [];
       const personality = capBullets(ch.personality, MAX_BULLETS_PER_CATEGORY);
       const history = capBullets(ch.history, MAX_BULLETS_PER_CATEGORY);
-      const powers = truncateBullets(ch.powers);
-      const trivia = truncateBullets(ch.trivia);
+      // No cap at all — full text, every bullet, count and length unbounded.
+      const powers = ch.powers || [];
+      const trivia = ch.trivia || [];
       if (personality.length) parts.push(`**Personality**\n${personality.map((b) => `- ${b}`).join('\n')}`);
       if (history.length) parts.push(`**History**\n${history.map((b) => `- ${b}`).join('\n')}`);
       if (powers.length) parts.push(`**Powers/Abilities**\n${powers.map((b) => `- ${b}`).join('\n')}`);
@@ -746,10 +742,13 @@
     return { active, mentionedOnly };
   }
 
-  // Assembles the injected text from already-capped blocks/stubs, then
-  // enforces MAX_INJECTION_CHARS by dropping whole pieces — stub lines first
-  // (cheapest to lose), then full-profile blocks from the end of the match
-  // order — rather than ever truncating inside a block.
+  // Assembles the injected text from active blocks (full episode plots +
+  // character profiles) and mentioned-only stubs. There is no overall size
+  // ceiling here — everything matched gets included, in full, every time.
+  // If the corpus grows large this can produce a big injected block; that's
+  // intentional (nothing should be silently dropped to stay under a budget),
+  // but it does mean a chat that matches many episodes/characters at once
+  // can push a lot of text into chatParams.systemMessage.
   //
   // The header (fandom + arc) is now ALWAYS included, even with zero
   // matches — previously this returned '' until something was actually
@@ -783,16 +782,7 @@
       return text.trim();
     };
 
-    let text = assemble();
-    while (text.length > MAX_INJECTION_CHARS && stubLines.length) {
-      stubLines.pop();
-      text = assemble();
-    }
-    while (text.length > MAX_INJECTION_CHARS && activeBlocks.length > 1) {
-      activeBlocks.pop();
-      text = assemble();
-    }
-    return text;
+    return assemble();
   }
 
   // ASSUMPTION, unverified: a chat's turns live at `chat.messages`, an array
